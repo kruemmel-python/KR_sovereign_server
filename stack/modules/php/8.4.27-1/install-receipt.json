@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "module": "php",
+  "version": "8.4.27-1",
+  "platform": "windows-x64",
+  "packageFile": "php-8.4.27-1-nts-Win32-vs17-x64.zip",
+  "packageSha256": "DBAE154A0A89791F36C3D48E68BAE797878333E7D6CB5721E74617DE59B63AB7",
+  "installedUtc": "2026-11-07T07:00:00Z",
+  "payloadSubpath": ".",
+  "entrySubpath": "php-cgi.exe",
+  "entrySha256": "2ABF2039D2327D8F564CD29735E02F64DFDE8B44645E1EB888F4054D0C96B393",
+  "criticalFiles": [
+    {
+      "path": "php-cgi.exe",
+      "sha256": "2ABF2039D2327D8F564CD29735E02F64DFDE8B44645E1EB888F4054D0C96B393"
+    },
+    {
+      "path": "php8.dll",
+      "sha256": "D3AB8A382818C1D937E8D88464BDA8C031AA73179AE092BA8A660F1C8FF87661"
+    }
+  ]
+}

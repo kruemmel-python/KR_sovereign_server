@@ -1,0 +1,219 @@
+// ============================================================================
+// KR Unified Language - Module: Orchestration (Concurrency, Tasks & EventHub)
+// Language: Go (Goroutines, Channels, Admission & Pub/Sub Queue)
+// ============================================================================
+
+import "sync"
+import "sync/atomic"
+import "time"
+
+// ----------------------------------------------------------------------------
+// Admission Semaphore (Bounded Concurrency)
+// ----------------------------------------------------------------------------
+
+var admissionInitOnce sync.Once
+var admissionSem chan struct{}
+var activeConns atomic.Int32
+
+func go_admission_init(maxConns int32) bool {
+    if maxConns <= 0 || maxConns > 768 {
+        return false
+    }
+    admissionInitOnce.Do(func() {
+        admissionSem = make(chan struct{}, maxConns)
+    })
+    return admissionSem != nil
+}
+
+func go_admission_acquire() bool {
+    if admissionSem == nil {
+        return false
+    }
+    select {
+    case admissionSem <- struct{}{}:
+        activeConns.Add(1)
+        return true
+    default:
+        return false // Over capacity: HTTP 503 Service Unavailable
+    }
+}
+
+func go_admission_release() {
+    if admissionSem != nil {
+        select {
+        case <-admissionSem:
+            activeConns.Add(-1)
+        default:
+        }
+    }
+}
+
+func go_get_active_conns() int32 {
+    return activeConns.Load()
+}
+
+// ----------------------------------------------------------------------------
+// Background Task Queue & Worker Goroutines
+// ----------------------------------------------------------------------------
+
+type TaskRecord struct {
+    TaskType  int32
+    PayloadId int64
+    Retries   int32
+}
+
+var taskInitOnce sync.Once
+var taskQueue chan TaskRecord
+var tasksProcessed atomic.Int64
+
+func runTaskWorker(id int, queue <-chan TaskRecord) {
+    for task := range queue {
+        // Simulate async task execution (e.g. email, DB write, cache flush)
+        if task.TaskType > 0 {
+            time.Sleep(1 * time.Millisecond)
+        }
+        tasksProcessed.Add(1)
+    }
+}
+
+func go_task_init(workers int32, queueCap int32) bool {
+    if workers <= 0 || workers > 256 || queueCap <= 0 || queueCap > 65536 {
+        return false
+    }
+    taskInitOnce.Do(func() {
+        taskQueue = make(chan TaskRecord, queueCap)
+        for i := 0; i < int(workers); i++ {
+            go runTaskWorker(i, taskQueue)
+        }
+    })
+    return taskQueue != nil
+}
+
+func go_task_enqueue(taskType int32, payloadId int64) bool {
+    if taskQueue == nil {
+        return false
+    }
+    select {
+    case taskQueue <- TaskRecord{TaskType: taskType, PayloadId: payloadId, Retries: 0}:
+        return true
+    default:
+        return false // Queue is full
+    }
+}
+
+func go_task_get_processed() int64 {
+    return tasksProcessed.Load()
+}
+
+func go_task_get_queue_len() int32 {
+    if taskQueue == nil {
+        return 0
+    }
+    return int32(len(taskQueue))
+}
+
+// ----------------------------------------------------------------------------
+// EventHub Pub/Sub Broker
+// ----------------------------------------------------------------------------
+
+type EventHubBroker struct {
+    mu          sync.RWMutex
+    topics      map[int32][]chan int64
+    published   atomic.Int64
+    subscribers atomic.Int32
+}
+
+var hubOnce sync.Once
+var globalHub *EventHubBroker
+
+func getEventHub() *EventHubBroker {
+    hubOnce.Do(func() {
+        globalHub = &EventHubBroker{
+            topics: make(map[int32][]chan int64),
+        }
+    })
+    return globalHub
+}
+
+func go_eventhub_publish(topicId int32, eventVal int64) bool {
+    hub := getEventHub()
+    hub.mu.RLock()
+    subs, exists := hub.topics[topicId]
+    hub.mu.RUnlock()
+
+    hub.published.Add(1)
+    if !exists || len(subs) == 0 {
+        return true
+    }
+
+    for _, ch := range subs {
+        select {
+        case ch <- eventVal:
+        default:
+            // Non-blocking write to avoid head-of-line blocking
+        }
+    }
+    return true
+}
+
+func go_eventhub_subscribe(topicId int32) int32 {
+    hub := getEventHub()
+    hub.mu.Lock()
+    defer hub.mu.Unlock()
+    if len(hub.topics) >= 1024 {
+        if _, exists := hub.topics[topicId]; !exists {
+            return -1
+        }
+    }
+    if len(hub.topics[topicId]) >= 1024 {
+        return -1
+    }
+    ch := make(chan int64, 64)
+    hub.topics[topicId] = append(hub.topics[topicId], ch)
+    hub.subscribers.Add(1)
+    subCount := int32(len(hub.topics[topicId]))
+    return subCount
+}
+
+func go_eventhub_published_count() int64 {
+    hub := getEventHub()
+    return hub.published.Load()
+}
+
+func go_eventhub_subscribers_count() int32 {
+    hub := getEventHub()
+    return hub.subscribers.Load()
+}
+
+// ----------------------------------------------------------------------------
+// Metrics & Latency Profiler
+// ----------------------------------------------------------------------------
+
+var metricsTotalReq atomic.Int64
+var metricsTotalMicro atomic.Int64
+var metricsErrors atomic.Int64
+
+func go_record_request(statusCode int32, latencyMicros int64) {
+    metricsTotalReq.Add(1)
+    metricsTotalMicro.Add(latencyMicros)
+    if statusCode >= 400 {
+        metricsErrors.Add(1)
+    }
+}
+
+func go_metrics_total_requests() int64 {
+    return metricsTotalReq.Load()
+}
+
+func go_metrics_average_latency_us() float64 {
+    tot := metricsTotalReq.Load()
+    micros := metricsTotalMicro.Load()
+    if tot > 0 {
+        return float64(micros) / float64(tot)
+    }
+    return 0.0
+}
+
+func go_metrics_error_count() int64 {
+    return metricsErrors.Load()
+}

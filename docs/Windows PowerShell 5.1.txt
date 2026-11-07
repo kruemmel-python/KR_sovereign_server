@@ -1,0 +1,9 @@
+PS F:\old_sourcecodes\sovereign_server_v9_professional\KR_sovereign_server> .\start_secure.ps1 -Port 8085 -Workers 8
+=================================================================
+  Sovereign Server V10 Professional (KR Multi-Language Fusion)
+  C++20 (Networking) + Rust (Crypto/Protocol) + Go (Orchestration)
+=================================================================
+  Server bound and listening on http://127.0.0.1:8085
+  Worker Threads: 8
+  Press CTRL+C to gracefully stop the server.
+-----------------------------------------------------------------

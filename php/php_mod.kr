@@ -1,0 +1,747 @@
+// ============================================================================
+// KR Unified Language - Module: PHP/CMS Runtime Gateway
+// Language: C++20 (bounded CGI process isolation and static file delivery)
+// ============================================================================
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#include <windows.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <cctype>
+#include <cwctype>
+
+static std::wstring g_php_executable;
+static std::wstring g_php_document_root;
+static std::wstring g_php_ini_directory;
+static std::wstring g_php_temp_directory;
+static std::wstring g_php_cgi_log;
+static std::wstring g_php_system_root;
+static std::wstring g_php_server_port;
+static std::wstring g_php_cms_db_host;
+static std::wstring g_php_cms_db_port;
+static std::wstring g_php_cms_db_name;
+static std::wstring g_php_cms_db_user;
+static std::wstring g_php_cms_db_password;
+static bool g_php_cms_db_configured = false;
+static std::atomic<bool> g_php_enabled{false};
+static std::atomic<int32_t> g_php_active{0};
+static int32_t g_php_max_processes = 1;
+static std::mutex g_php_log_mutex;
+
+static constexpr int32_t PHP_MAX_REQUEST_BODY = 16 * 1024 * 1024;
+static constexpr int32_t PHP_MAX_RESPONSE_BODY = 16 * 1024 * 1024;
+static constexpr size_t PHP_MAX_CGI_HEADERS = 8192;
+static constexpr DWORD PHP_PROCESS_TIMEOUT_MS = 30000;
+
+static bool php_utf8_to_wide(const std::string& input, std::wstring& output) {
+    if (input.empty()) { output.clear(); return true; }
+    int needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(),
+                                     static_cast<int>(input.size()), nullptr, 0);
+    if (needed <= 0) return false;
+    output.resize(static_cast<size_t>(needed));
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(),
+                               static_cast<int>(input.size()), output.data(), needed) == needed;
+}
+
+static bool php_wide_to_utf8(const std::wstring& input, std::string& output) {
+    if (input.empty()) { output.clear(); return true; }
+    int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, input.data(),
+                                     static_cast<int>(input.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return false;
+    output.resize(static_cast<size_t>(needed));
+    return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, input.data(),
+                               static_cast<int>(input.size()), output.data(), needed, nullptr, nullptr) == needed;
+}
+
+static bool php_get_env_wide(const wchar_t* name, std::wstring& value, bool required) {
+    DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+    if (needed == 0) {
+        value.clear();
+        return !required;
+    }
+    std::vector<wchar_t> buffer(static_cast<size_t>(needed));
+    DWORD written = GetEnvironmentVariableW(name, buffer.data(), needed);
+    if (written == 0 || written >= needed) return false;
+    value.assign(buffer.data(), written);
+    return !value.empty() || !required;
+}
+
+static bool php_full_path(const std::wstring& input, std::wstring& output) {
+    if (input.empty()) return false;
+    DWORD needed = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
+    if (needed == 0 || needed > 32767) return false;
+    std::vector<wchar_t> buffer(static_cast<size_t>(needed));
+    DWORD written = GetFullPathNameW(input.c_str(), needed, buffer.data(), nullptr);
+    if (written == 0 || written >= needed) return false;
+    output.assign(buffer.data(), written);
+    while (output.size() > 3 && (output.back() == L'\\' || output.back() == L'/')) output.pop_back();
+    return true;
+}
+
+static bool php_path_is_under_root(const std::wstring& root, const std::wstring& candidate) {
+    if (candidate.size() < root.size()) return false;
+    if (_wcsnicmp(root.c_str(), candidate.c_str(), root.size()) != 0) return false;
+    return candidate.size() == root.size() || candidate[root.size()] == L'\\' || candidate[root.size()] == L'/';
+}
+
+static bool php_path_has_reparse_component(const std::wstring& root, const std::wstring& candidate) {
+    if (!php_path_is_under_root(root, candidate)) return true;
+    std::wstring current = root;
+    DWORD root_attrs = GetFileAttributesW(current.c_str());
+    if (root_attrs == INVALID_FILE_ATTRIBUTES || (root_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return true;
+    size_t position = root.size();
+    while (position < candidate.size()) {
+        while (position < candidate.size() && (candidate[position] == L'\\' || candidate[position] == L'/')) position++;
+        if (position >= candidate.size()) break;
+        size_t next = candidate.find_first_of(L"\\/", position);
+        current += L"\\" + candidate.substr(position, next == std::wstring::npos ? std::wstring::npos : next - position);
+        DWORD attrs = GetFileAttributesW(current.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return true;
+        if (next == std::wstring::npos) break;
+        position = next;
+    }
+    return false;
+}
+
+static bool php_ascii_safe_header_name(const std::string& name) {
+    if (name.empty() || name.size() > 128) return false;
+    for (unsigned char c : name) {
+        bool ok = std::isalnum(c) || c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+                  c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' || c == '^' ||
+                  c == '_' || c == '`' || c == '|' || c == '~';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool php_safe_header_value(const std::string& value) {
+    if (value.size() > 4096) return false;
+    for (unsigned char c : value) if (c < 32 || c == 127) return false;
+    return true;
+}
+
+static std::string php_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+static std::string php_trim(const std::string& value) {
+    size_t begin = 0;
+    while (begin < value.size() && (value[begin] == ' ' || value[begin] == '\t')) begin++;
+    size_t end = value.size();
+    while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
+    return value.substr(begin, end - begin);
+}
+
+static bool php_percent_decode_path(const std::string& raw_target, std::string& decoded_path,
+                                    std::string& query_string) {
+    size_t query = raw_target.find('?');
+    std::string raw_path = raw_target.substr(0, query);
+    query_string = query == std::string::npos ? "" : raw_target.substr(query + 1);
+    if (raw_path.empty() || raw_path[0] != '/' || raw_path.size() > 2048 || query_string.size() > 4096) return false;
+    for (unsigned char c : query_string) if (c < 32 || c == 127) return false;
+
+    decoded_path.clear();
+    decoded_path.reserve(raw_path.size());
+    auto hex_value = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < raw_path.size(); i++) {
+        unsigned char c = static_cast<unsigned char>(raw_path[i]);
+        if (c == '%') {
+            if (i + 2 >= raw_path.size()) return false;
+            int hi = hex_value(raw_path[i + 1]);
+            int lo = hex_value(raw_path[i + 2]);
+            if (hi < 0 || lo < 0) return false;
+            c = static_cast<unsigned char>((hi << 4) | lo);
+            i += 2;
+            if (c == '/' || c == '\\' || c == 0 || c == ':') return false;
+        }
+        if (c == '\\' || c == 0 || c < 32 || c == 127 || c == ':') return false;
+        decoded_path.push_back(static_cast<char>(c));
+    }
+
+    size_t start = 1;
+    while (start <= decoded_path.size()) {
+        size_t slash = decoded_path.find('/', start);
+        std::string segment = decoded_path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (segment == "." || segment == ".." || (!segment.empty() && segment[0] == '.' && segment != ".well-known")) return false;
+        if (slash == std::string::npos) break;
+        if (slash + 1 < decoded_path.size() && decoded_path[slash + 1] == '/') return false;
+        start = slash + 1;
+    }
+    return true;
+}
+
+static std::string php_mime_type(const std::wstring& path) {
+    std::wstring ext = std::filesystem::path(path).extension().wstring();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    if (ext == L".html" || ext == L".htm") return "text/html; charset=utf-8";
+    if (ext == L".css") return "text/css; charset=utf-8";
+    if (ext == L".js" || ext == L".mjs") return "text/javascript; charset=utf-8";
+    if (ext == L".json") return "application/json; charset=utf-8";
+    if (ext == L".xml") return "application/xml; charset=utf-8";
+    if (ext == L".txt") return "text/plain; charset=utf-8";
+    if (ext == L".svg") return "image/svg+xml";
+    if (ext == L".png") return "image/png";
+    if (ext == L".jpg" || ext == L".jpeg") return "image/jpeg";
+    if (ext == L".gif") return "image/gif";
+    if (ext == L".webp") return "image/webp";
+    if (ext == L".avif") return "image/avif";
+    if (ext == L".ico") return "image/x-icon";
+    if (ext == L".woff") return "font/woff";
+    if (ext == L".woff2") return "font/woff2";
+    if (ext == L".webmanifest") return "application/manifest+json";
+    if (ext == L".wasm") return "application/wasm";
+    if (ext == L".mp3") return "audio/mpeg";
+    if (ext == L".wav") return "audio/wav";
+    if (ext == L".ogg") return "audio/ogg";
+    if (ext == L".mp4") return "video/mp4";
+    if (ext == L".webm") return "video/webm";
+    if (ext == L".pdf") return "application/pdf";
+    if (ext == L".zip") return "application/zip";
+    return "application/octet-stream";
+}
+
+static bool php_static_extension_allowed(const std::wstring& path) {
+    std::wstring ext = std::filesystem::path(path).extension().wstring();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    static const std::set<std::wstring> allowed = {
+        L".html", L".htm", L".css", L".js", L".mjs", L".json", L".xml", L".txt",
+        L".png", L".jpg", L".jpeg", L".gif", L".webp", L".avif", L".ico",
+        L".woff", L".woff2", L".webmanifest", L".wasm",
+        L".mp3", L".wav", L".ogg", L".mp4", L".webm", L".pdf", L".zip"
+    };
+    return allowed.find(ext) != allowed.end();
+}
+
+static void php_append_cgi_log(const std::string& message) {
+    if (message.empty() || g_php_cgi_log.empty()) return;
+    std::lock_guard<std::mutex> lock(g_php_log_mutex);
+    std::ofstream log(std::filesystem::path(g_php_cgi_log), std::ios::binary | std::ios::app);
+    if (!log) return;
+    std::string safe;
+    safe.reserve(message.size());
+    for (unsigned char c : message) {
+        if (c == '\r' || c == '\n') safe.push_back(' ');
+        else if (c == '\t' || (c >= 32 && c != 127)) safe.push_back(static_cast<char>(c));
+    }
+    log << safe.substr(0, 65536) << "\n";
+}
+
+static std::map<std::string, std::string> php_parse_request_headers(const std::string& raw_headers) {
+    std::map<std::string, std::string> result;
+    size_t position = raw_headers.find("\r\n");
+    if (position == std::string::npos) return result;
+    position += 2;
+    while (position < raw_headers.size()) {
+        size_t end = raw_headers.find("\r\n", position);
+        if (end == std::string::npos || end == position) break;
+        std::string line = raw_headers.substr(position, end - position);
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string name = php_lower(line.substr(0, colon));
+            std::string value = php_trim(line.substr(colon + 1));
+            if (php_ascii_safe_header_name(name) && php_safe_header_value(value)) {
+                auto found = result.find(name);
+                if (found == result.end()) result.emplace(name, value);
+                else found->second += ", " + value;
+            }
+        }
+        position = end + 2;
+    }
+    return result;
+}
+
+static bool php_build_environment(const std::string& method,
+                                                   const std::string& raw_target,
+                                                   const std::string& query,
+                                                   const std::wstring& script_filename,
+                                                   const std::string& script_name,
+                                                   const std::string& raw_headers,
+                                                   size_t body_size,
+                                                   std::vector<wchar_t>& block) {
+    std::map<std::wstring, std::wstring> env;
+    auto put = [&env](const std::wstring& key, const std::wstring& value) {
+        if (key.find(L'=') == std::wstring::npos && value.find(L'\0') == std::wstring::npos) env[key] = value;
+    };
+    put(L"SystemRoot", g_php_system_root);
+    put(L"TEMP", g_php_temp_directory);
+    put(L"TMP", g_php_temp_directory);
+    put(L"PHPRC", g_php_ini_directory);
+    put(L"REDIRECT_STATUS", L"200");
+    put(L"GATEWAY_INTERFACE", L"CGI/1.1");
+    put(L"SERVER_PROTOCOL", L"HTTP/1.1");
+    put(L"SERVER_SOFTWARE", L"Sovereign-KR");
+    put(L"SERVER_ADDR", L"127.0.0.1");
+    put(L"SERVER_PORT", g_php_server_port);
+    put(L"REMOTE_ADDR", L"127.0.0.1");
+    put(L"SERVER_NAME", L"localhost");
+    put(L"DOCUMENT_ROOT", g_php_document_root);
+    put(L"SCRIPT_FILENAME", script_filename);
+    if (g_php_cms_db_configured) {
+        put(L"SOVEREIGN_CMS_DB_HOST", g_php_cms_db_host);
+        put(L"SOVEREIGN_CMS_DB_PORT", g_php_cms_db_port);
+        put(L"SOVEREIGN_CMS_DB_NAME", g_php_cms_db_name);
+        put(L"SOVEREIGN_CMS_DB_USER", g_php_cms_db_user);
+        put(L"SOVEREIGN_CMS_DB_PASSWORD", g_php_cms_db_password);
+    }
+    std::wstring wide;
+    if (!php_utf8_to_wide(method, wide)) return false;
+    put(L"REQUEST_METHOD", wide);
+    if (!php_utf8_to_wide(query, wide)) return false;
+    put(L"QUERY_STRING", wide);
+    if (!php_utf8_to_wide(raw_target, wide)) return false;
+    put(L"REQUEST_URI", wide);
+    if (!php_utf8_to_wide(script_name, wide)) return false;
+    put(L"SCRIPT_NAME", wide);
+    put(L"CONTENT_LENGTH", std::to_wstring(body_size));
+
+    auto headers = php_parse_request_headers(raw_headers);
+    auto content_type = headers.find("content-type");
+    if (content_type != headers.end()) {
+        if (!php_utf8_to_wide(content_type->second, wide)) return false;
+        put(L"CONTENT_TYPE", wide);
+    }
+    static const std::set<std::string> skipped = {
+        "connection", "content-length", "content-type", "keep-alive", "proxy", "proxy-authorization",
+        "te", "trailer", "transfer-encoding", "upgrade"
+    };
+    for (const auto& header : headers) {
+        if (skipped.find(header.first) != skipped.end()) continue;
+        std::string env_name = "HTTP_";
+        for (unsigned char c : header.first) env_name.push_back(c == '-' ? '_' : static_cast<char>(std::toupper(c)));
+        std::wstring wide_name;
+        if (!php_utf8_to_wide(env_name, wide_name) || !php_utf8_to_wide(header.second, wide)) continue;
+        put(wide_name, wide);
+    }
+
+    block.clear();
+    for (const auto& item : env) {
+        std::wstring line = item.first + L"=" + item.second;
+        block.insert(block.end(), line.begin(), line.end());
+        block.push_back(L'\0');
+    }
+    block.push_back(L'\0');
+    return true;
+}
+
+static void php_pipe_write_and_close(HANDLE handle, const std::string& data) {
+    size_t offset = 0;
+    while (offset < data.size()) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - offset, 65536));
+        DWORD written = 0;
+        if (!WriteFile(handle, data.data() + offset, chunk, &written, nullptr) || written == 0) break;
+        offset += written;
+    }
+    CloseHandle(handle);
+}
+
+static void php_pipe_read_bounded(HANDLE handle, std::string& output, size_t limit, std::atomic<bool>& overflow) {
+    char buffer[8192];
+    while (true) {
+        DWORD read = 0;
+        if (!ReadFile(handle, buffer, sizeof(buffer), &read, nullptr) || read == 0) break;
+        if (output.size() < limit) {
+            size_t keep = std::min<size_t>(read, limit - output.size());
+            output.append(buffer, keep);
+            if (keep < read) overflow.store(true);
+        } else {
+            overflow.store(true);
+        }
+    }
+    CloseHandle(handle);
+}
+
+static int32_t php_run_cgi(const std::string& method,
+                           const std::string& raw_target,
+                           const std::string& query,
+                           const std::wstring& script_filename,
+                           const std::string& script_name,
+                           const std::string& raw_headers,
+                           const std::string& body,
+                           int32_t& status,
+                           std::string& content_type,
+                           std::string& response_headers,
+                           std::string& response_body) {
+    int32_t current = g_php_active.load(std::memory_order_relaxed);
+    while (current < g_php_max_processes) {
+        if (g_php_active.compare_exchange_weak(current, current + 1, std::memory_order_acquire)) break;
+    }
+    if (current >= g_php_max_processes) return -503;
+    struct SlotRelease { ~SlotRelease() { g_php_active.fetch_sub(1, std::memory_order_release); } } slot_release;
+
+    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    HANDLE child_stdin_read = nullptr, parent_stdin_write = nullptr;
+    HANDLE parent_stdout_read = nullptr, child_stdout_write = nullptr;
+    HANDLE parent_stderr_read = nullptr, child_stderr_write = nullptr;
+    if (!CreatePipe(&child_stdin_read, &parent_stdin_write, &security, 0) ||
+        !CreatePipe(&parent_stdout_read, &child_stdout_write, &security, 0) ||
+        !CreatePipe(&parent_stderr_read, &child_stderr_write, &security, 0)) {
+        if (child_stdin_read) CloseHandle(child_stdin_read);
+        if (parent_stdin_write) CloseHandle(parent_stdin_write);
+        if (parent_stdout_read) CloseHandle(parent_stdout_read);
+        if (child_stdout_write) CloseHandle(child_stdout_write);
+        if (parent_stderr_read) CloseHandle(parent_stderr_read);
+        if (child_stderr_write) CloseHandle(child_stderr_write);
+        return -500;
+    }
+    if (!SetHandleInformation(parent_stdin_write, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(parent_stdout_read, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(parent_stderr_read, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(child_stdin_read); CloseHandle(parent_stdin_write); CloseHandle(parent_stdout_read);
+        CloseHandle(child_stdout_write); CloseHandle(parent_stderr_read); CloseHandle(child_stderr_write);
+        return -500;
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = child_stdin_read;
+    startup.hStdOutput = child_stdout_write;
+    startup.hStdError = child_stderr_write;
+    PROCESS_INFORMATION process{};
+    std::wstring command = L"\"" + g_php_executable + L"\"";
+    std::vector<wchar_t> command_buffer(command.begin(), command.end());
+    command_buffer.push_back(L'\0');
+    std::vector<wchar_t> environment;
+    if (!php_build_environment(method, raw_target, query, script_filename, script_name,
+                               raw_headers, body.size(), environment)) {
+        CloseHandle(child_stdin_read); CloseHandle(parent_stdin_write); CloseHandle(parent_stdout_read);
+        CloseHandle(child_stdout_write); CloseHandle(parent_stderr_read); CloseHandle(child_stderr_write);
+        return -400;
+    }
+    std::wstring working_directory = std::filesystem::path(script_filename).parent_path().wstring();
+
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) {
+        CloseHandle(child_stdin_read); CloseHandle(parent_stdin_write); CloseHandle(parent_stdout_read);
+        CloseHandle(child_stdout_write); CloseHandle(parent_stderr_read); CloseHandle(child_stderr_write);
+        return -500;
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                                               JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+                                               JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+    limits.BasicLimitInformation.ActiveProcessLimit = 1;
+    limits.ProcessMemoryLimit = static_cast<SIZE_T>(384) * 1024 * 1024;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        CloseHandle(job); CloseHandle(child_stdin_read); CloseHandle(parent_stdin_write);
+        CloseHandle(parent_stdout_read); CloseHandle(child_stdout_write); CloseHandle(parent_stderr_read);
+        CloseHandle(child_stderr_write); return -500;
+    }
+
+    BOOL created = CreateProcessW(g_php_executable.c_str(), command_buffer.data(), nullptr, nullptr, TRUE,
+                                  CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+                                  environment.data(), working_directory.c_str(), &startup, &process);
+    CloseHandle(child_stdin_read);
+    CloseHandle(child_stdout_write);
+    CloseHandle(child_stderr_write);
+    if (!created) {
+        CloseHandle(job); CloseHandle(parent_stdin_write); CloseHandle(parent_stdout_read); CloseHandle(parent_stderr_read);
+        return -500;
+    }
+    if (!AssignProcessToJobObject(job, process.hProcess) || ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        TerminateProcess(process.hProcess, 1);
+        CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(job);
+        CloseHandle(parent_stdin_write); CloseHandle(parent_stdout_read); CloseHandle(parent_stderr_read);
+        return -500;
+    }
+    CloseHandle(process.hThread);
+
+    std::string stdout_data, stderr_data;
+    std::atomic<bool> stdout_overflow{false}, stderr_overflow{false};
+    std::thread writer(php_pipe_write_and_close, parent_stdin_write, std::cref(body));
+    std::thread stdout_reader(php_pipe_read_bounded, parent_stdout_read, std::ref(stdout_data),
+                              static_cast<size_t>(PHP_MAX_RESPONSE_BODY) + PHP_MAX_CGI_HEADERS + 4,
+                              std::ref(stdout_overflow));
+    std::thread stderr_reader(php_pipe_read_bounded, parent_stderr_read, std::ref(stderr_data), 65536,
+                              std::ref(stderr_overflow));
+    DWORD wait = WaitForSingleObject(process.hProcess, PHP_PROCESS_TIMEOUT_MS);
+    if (wait != WAIT_OBJECT_0) {
+        TerminateJobObject(job, 124);
+        WaitForSingleObject(process.hProcess, 5000);
+    }
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hProcess);
+    CloseHandle(job);
+    writer.join(); stdout_reader.join(); stderr_reader.join();
+    if (!stderr_data.empty()) php_append_cgi_log(stderr_data);
+    if (wait != WAIT_OBJECT_0) return -504;
+    if (stdout_overflow.load()) return -413;
+    if (exit_code != 0 && stdout_data.empty()) return -500;
+
+    size_t separator = stdout_data.find("\r\n\r\n");
+    size_t separator_size = 4;
+    if (separator == std::string::npos) { separator = stdout_data.find("\n\n"); separator_size = 2; }
+    if (separator == std::string::npos || separator > PHP_MAX_CGI_HEADERS) return -500;
+    std::string header_block = stdout_data.substr(0, separator);
+    response_body = stdout_data.substr(separator + separator_size);
+    if (response_body.size() > static_cast<size_t>(PHP_MAX_RESPONSE_BODY)) return -413;
+
+    status = 200;
+    content_type = "text/html; charset=utf-8";
+    response_headers.clear();
+    bool location_seen = false;
+    std::istringstream header_stream(header_block);
+    std::string line;
+    while (std::getline(header_stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) return -500;
+        std::string name = line.substr(0, colon);
+        std::string value = php_trim(line.substr(colon + 1));
+        if (!php_ascii_safe_header_name(name) || !php_safe_header_value(value)) return -500;
+        std::string lower_name = php_lower(name);
+        if (lower_name == "status") {
+            if (value.size() < 3 || !std::isdigit(static_cast<unsigned char>(value[0])) ||
+                !std::isdigit(static_cast<unsigned char>(value[1])) || !std::isdigit(static_cast<unsigned char>(value[2]))) return -500;
+            int parsed = std::stoi(value.substr(0, 3));
+            if (parsed < 200 || parsed > 599) return -500;
+            status = parsed;
+        } else if (lower_name == "content-type") {
+            content_type = value;
+        } else if (lower_name == "location") {
+            location_seen = true;
+            response_headers += "Location: " + value + "\r\n";
+        } else if (lower_name == "connection" || lower_name == "content-length" ||
+                   lower_name == "transfer-encoding" || lower_name == "keep-alive" ||
+                   lower_name == "trailer" || lower_name == "te" || lower_name == "upgrade" ||
+                   lower_name == "server" || lower_name == "x-powered-by") {
+            continue;
+        } else {
+            if (response_headers.size() + name.size() + value.size() + 4 > PHP_MAX_CGI_HEADERS) return -500;
+            response_headers += name + ": " + value + "\r\n";
+        }
+    }
+    if (location_seen && status == 200) status = 302;
+    if (method == "HEAD" || status == 204 || status == 304) response_body.clear();
+    return static_cast<int32_t>(response_body.size());
+}
+
+extern "C" bool cpp_php_module_init() {
+    g_php_enabled.store(false);
+    g_php_cms_db_configured = false;
+    g_php_cms_db_password.clear();
+    std::wstring enabled, executable, root, ini_path, temp, log, system_root, server_port;
+    if (!php_get_env_wide(L"SOVEREIGN_PHP_ENABLED", enabled, false)) return false;
+    if (enabled.empty() || enabled == L"0") return true;
+    if (enabled != L"1") return false;
+    if (!php_get_env_wide(L"SOVEREIGN_PHP_CGI", executable, true)) return false;
+    if (!php_get_env_wide(L"SOVEREIGN_DOCUMENT_ROOT", root, true) ||
+        !php_get_env_wide(L"SOVEREIGN_PHP_INI", ini_path, true) ||
+        !php_get_env_wide(L"SOVEREIGN_RUNTIME_TEMP", temp, true) ||
+        !php_get_env_wide(L"SOVEREIGN_PHP_CGI_LOG", log, true) ||
+        !php_get_env_wide(L"SystemRoot", system_root, true) ||
+        !php_get_env_wide(L"SOVEREIGN_SERVER_PORT", server_port, true)) return false;
+    if (server_port.empty() || server_port.size() > 5 ||
+        !std::all_of(server_port.begin(), server_port.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; })) return false;
+    int parsed_port = _wtoi(server_port.c_str());
+    if (parsed_port < 1 || parsed_port > 65535) return false;
+
+    std::wstring exe_full, root_full, ini_full, temp_full, log_full;
+    if (!php_full_path(executable, exe_full) || !php_full_path(root, root_full) ||
+        !php_full_path(ini_path, ini_full) || !php_full_path(temp, temp_full) ||
+        !php_full_path(log, log_full)) return false;
+    DWORD exe_attrs = GetFileAttributesW(exe_full.c_str());
+    DWORD root_attrs = GetFileAttributesW(root_full.c_str());
+    DWORD ini_attrs = GetFileAttributesW(ini_full.c_str());
+    DWORD temp_attrs = GetFileAttributesW(temp_full.c_str());
+    if (exe_attrs == INVALID_FILE_ATTRIBUTES || (exe_attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+        root_attrs == INVALID_FILE_ATTRIBUTES || (root_attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        ini_attrs == INVALID_FILE_ATTRIBUTES || (ini_attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+        temp_attrs == INVALID_FILE_ATTRIBUTES || (temp_attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (exe_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        (root_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        (ini_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        (temp_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
+
+    wchar_t max_processes[16] = {0};
+    DWORD max_len = GetEnvironmentVariableW(L"SOVEREIGN_PHP_MAX_PROCESSES", max_processes, 16);
+    if (max_len == 0 || max_len >= 16 ||
+        !std::all_of(max_processes, max_processes + max_len, [](wchar_t c) { return c >= L'0' && c <= L'9'; })) return false;
+    int parsed_max = max_len > 0 && max_len < 16 ? _wtoi(max_processes) : 1;
+    if (parsed_max < 1 || parsed_max > 32) return false;
+
+    std::wstring db_host, db_port, db_name, db_user, db_password;
+    if (!php_get_env_wide(L"SOVEREIGN_CMS_DB_HOST", db_host, false) ||
+        !php_get_env_wide(L"SOVEREIGN_CMS_DB_PORT", db_port, false) ||
+        !php_get_env_wide(L"SOVEREIGN_CMS_DB_NAME", db_name, false) ||
+        !php_get_env_wide(L"SOVEREIGN_CMS_DB_USER", db_user, false) ||
+        !php_get_env_wide(L"SOVEREIGN_CMS_DB_PASSWORD", db_password, false)) return false;
+    bool any_db_value = !db_host.empty() || !db_port.empty() || !db_name.empty() || !db_user.empty() || !db_password.empty();
+    bool all_db_values = !db_host.empty() && !db_port.empty() && !db_name.empty() && !db_user.empty() && !db_password.empty();
+    if (any_db_value && !all_db_values) return false;
+    if (all_db_values) {
+        auto safe_identifier = [](const std::wstring& value) {
+            return !value.empty() && value.size() <= 64 &&
+                   std::all_of(value.begin(), value.end(), [](wchar_t c) {
+                       return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                              (c >= L'0' && c <= L'9') || c == L'_';
+                   });
+        };
+        if (db_host != L"127.0.0.1" || db_port.empty() || db_port.size() > 5 ||
+            !std::all_of(db_port.begin(), db_port.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; }) ||
+            _wtoi(db_port.c_str()) < 1 || _wtoi(db_port.c_str()) > 65535 ||
+            !safe_identifier(db_name) || !safe_identifier(db_user) ||
+            db_password.size() < 32 || db_password.size() > 256 ||
+            !std::all_of(db_password.begin(), db_password.end(), [](wchar_t c) { return c >= 32 && c != 127; })) return false;
+        g_php_cms_db_host = db_host;
+        g_php_cms_db_port = db_port;
+        g_php_cms_db_name = db_name;
+        g_php_cms_db_user = db_user;
+        g_php_cms_db_password = db_password;
+        g_php_cms_db_configured = true;
+    }
+
+    g_php_executable = exe_full;
+    g_php_document_root = root_full;
+    g_php_ini_directory = std::filesystem::path(ini_full).parent_path().wstring();
+    g_php_temp_directory = temp_full;
+    g_php_cgi_log = log_full;
+    g_php_system_root = system_root;
+    g_php_server_port = server_port;
+    g_php_max_processes = parsed_max;
+    g_php_active.store(0);
+    g_php_enabled.store(true);
+    return true;
+}
+
+extern "C" bool cpp_php_module_enabled() {
+    return g_php_enabled.load();
+}
+
+extern "C" int32_t cpp_php_handle_request(
+    uint64_t method_ptr, int32_t method_len,
+    uint64_t target_ptr, int32_t target_len,
+    uint64_t headers_ptr, int32_t headers_len,
+    uint64_t body_ptr, int32_t body_len,
+    uint64_t out_status_ptr,
+    uint64_t out_content_type_ptr, int32_t max_content_type,
+    uint64_t out_headers_ptr, int32_t max_headers,
+    uint64_t out_body_ptr, int32_t max_body) {
+    if (!g_php_enabled.load() || method_ptr == 0 || target_ptr == 0 || headers_ptr == 0 ||
+        out_status_ptr == 0 || out_content_type_ptr == 0 || out_headers_ptr == 0 || out_body_ptr == 0 ||
+        method_len <= 0 || method_len > 16 || target_len <= 0 || target_len > 4096 ||
+        headers_len <= 0 || headers_len > 8191 || body_len < 0 || body_len > PHP_MAX_REQUEST_BODY ||
+        (body_len > 0 && body_ptr == 0) || max_content_type < 32 || max_headers < 1 ||
+        max_body < 1 || max_body > PHP_MAX_RESPONSE_BODY) return -500;
+
+    std::string method(reinterpret_cast<const char*>(method_ptr), static_cast<size_t>(method_len));
+    std::string raw_target(reinterpret_cast<const char*>(target_ptr), static_cast<size_t>(target_len));
+    std::string raw_headers(reinterpret_cast<const char*>(headers_ptr), static_cast<size_t>(headers_len));
+    std::string body = body_len == 0 ? "" : std::string(reinterpret_cast<const char*>(body_ptr), static_cast<size_t>(body_len));
+    static const std::set<std::string> allowed_methods = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"};
+    if (allowed_methods.find(method) == allowed_methods.end()) return -405;
+
+    std::string decoded_path, query;
+    if (!php_percent_decode_path(raw_target, decoded_path, query)) return -400;
+    std::wstring decoded_wide;
+    if (!php_utf8_to_wide(decoded_path, decoded_wide)) return -400;
+    while (!decoded_wide.empty() && decoded_wide.front() == L'/') decoded_wide.erase(decoded_wide.begin());
+    std::wstring candidate_input = g_php_document_root + (decoded_wide.empty() ? L"" : L"\\" + decoded_wide);
+    std::wstring candidate;
+    if (!php_full_path(candidate_input, candidate) || !php_path_is_under_root(g_php_document_root, candidate) ||
+        php_path_has_reparse_component(g_php_document_root, candidate)) return -403;
+
+    DWORD attrs = GetFileAttributesW(candidate.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        std::wstring php_index = candidate + L"\\index.php";
+        std::wstring html_index = candidate + L"\\index.html";
+        if (GetFileAttributesW(php_index.c_str()) != INVALID_FILE_ATTRIBUTES) candidate = php_index;
+        else if (GetFileAttributesW(html_index.c_str()) != INVALID_FILE_ATTRIBUTES) candidate = html_index;
+        else return -404;
+        attrs = GetFileAttributesW(candidate.c_str());
+    }
+
+    bool front_controller = false;
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        std::wstring index = g_php_document_root + L"\\index.php";
+        DWORD index_attrs = GetFileAttributesW(index.c_str());
+        if (index_attrs == INVALID_FILE_ATTRIBUTES || (index_attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) return -404;
+        candidate = index;
+        attrs = index_attrs;
+        front_controller = true;
+    }
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return -403;
+    if (php_path_has_reparse_component(g_php_document_root, candidate)) return -403;
+
+    std::wstring extension = std::filesystem::path(candidate).extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    int32_t status = 200;
+    std::string content_type, response_headers, response_body;
+    int32_t result = 0;
+    if (extension == L".php") {
+        std::string script_name;
+        if (front_controller) script_name = "/index.php";
+        else {
+            std::wstring relative = candidate.substr(g_php_document_root.size());
+            std::replace(relative.begin(), relative.end(), L'\\', L'/');
+            if (!php_wide_to_utf8(relative, script_name)) return -500;
+            if (script_name.empty() || script_name.front() != '/') script_name.insert(script_name.begin(), '/');
+        }
+        result = php_run_cgi(method, raw_target, query, candidate, script_name,
+                             raw_headers, body, status, content_type, response_headers, response_body);
+        if (result < 0) return result;
+    } else {
+        if (method != "GET" && method != "HEAD") return -405;
+        if (!php_static_extension_allowed(candidate)) return -403;
+        LARGE_INTEGER size{};
+        HANDLE file = CreateFileW(candidate.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return -404;
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(file, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            !GetFileSizeEx(file, &size) || size.QuadPart < 0 || size.QuadPart > max_body) {
+            CloseHandle(file); return size.QuadPart > max_body ? -413 : -403;
+        }
+        content_type = php_mime_type(candidate);
+        if (method != "HEAD") {
+            response_body.resize(static_cast<size_t>(size.QuadPart));
+            size_t offset = 0;
+            while (offset < response_body.size()) {
+                DWORD wanted = static_cast<DWORD>(std::min<size_t>(response_body.size() - offset, 1 << 20));
+                DWORD read = 0;
+                if (!ReadFile(file, response_body.data() + offset, wanted, &read, nullptr) || read == 0) {
+                    CloseHandle(file); return -500;
+                }
+                offset += read;
+            }
+        }
+        CloseHandle(file);
+        response_headers = "X-Content-Source: static\r\n";
+        result = static_cast<int32_t>(response_body.size());
+    }
+
+    if (content_type.empty() || content_type.size() >= static_cast<size_t>(max_content_type) ||
+        response_headers.size() >= static_cast<size_t>(max_headers) ||
+        response_body.size() > static_cast<size_t>(max_body)) return -500;
+    *reinterpret_cast<int32_t*>(out_status_ptr) = status;
+    std::memcpy(reinterpret_cast<void*>(out_content_type_ptr), content_type.data(), content_type.size());
+    reinterpret_cast<char*>(out_content_type_ptr)[content_type.size()] = 0;
+    std::memcpy(reinterpret_cast<void*>(out_headers_ptr), response_headers.data(), response_headers.size());
+    reinterpret_cast<char*>(out_headers_ptr)[response_headers.size()] = 0;
+    if (!response_body.empty()) std::memcpy(reinterpret_cast<void*>(out_body_ptr), response_body.data(), response_body.size());
+    return static_cast<int32_t>(response_body.size());
+}

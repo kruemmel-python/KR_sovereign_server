@@ -1,0 +1,16 @@
+[project]
+name = "KR_sovereign_server"
+version = "10.0.0"
+entry = "main.kr"
+target = "WINDOWS"
+
+[modules]
+paths = ["protocol", "security", "orchestration", "php", "network"]
+
+[dependencies]
+sdl3 = false
+vcpkg = []
+
+[build]
+opt_level = 3
+arm64_baseline = "armv8-a"

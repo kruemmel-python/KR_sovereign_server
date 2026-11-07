@@ -1,0 +1,35 @@
+{
+    "schemaVersion":  1,
+    "active":  {
+                   "php":  "8.4.27-1",
+                   "mariadb":  "11.8.9"
+               },
+    "installed":  [
+                      {
+                          "module":  "php",
+                          "version":  "8.4.27-1",
+                          "installedUtc":  "2026-11-07T07:00:00Z",
+                          "sha256":  "DBAE154A0A89791F36C3D48E68BAE797878333E7D6CB5721E74617DE59B63AB7"
+                      },
+                      {
+                          "module":  "mariadb",
+                          "version":  "11.8.9",
+                          "installedUtc":  "2026-11-07T07:00:00Z",
+                          "sha256":  "830C46727D9278EAE212AE3ECA44EEB9E71B2A68704E95F344A64FBA7B1963F5"
+                      }
+                  ],
+    "services":  {
+                     "mariadb":  {
+                                     "pid":  20000,
+                                     "executable":  "F:\\old_sourcecodes\\sovereign_server_v9_professional\\KR_sovereign_server\\stack\\modules\\mariadb\\11.8.9\\mariadb-11.8.9-winx64\\bin\\mariadbd.exe",
+                                     "startedUtc":  "2026-11-07T07:16:08.9313443Z",
+                                     "port":  3308
+                                 },
+                     "server":  {
+                                    "pid":  17972,
+                                    "executable":  "F:\\old_sourcecodes\\sovereign_server_v9_professional\\KR_sovereign_server\\KR_BUILD\\kr-sovereign-server-56d51cc8.exe",
+                                    "startedUtc":  "2026-11-07T07:40:38.1764130Z",
+                                    "port":  8085
+                                }
+                 }
+}

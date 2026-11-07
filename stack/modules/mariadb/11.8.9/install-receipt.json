@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "module": "mariadb",
+  "version": "11.8.9",
+  "platform": "windows-x64",
+  "packageFile": "mariadb-11.8.9-winx64.zip",
+  "packageSha256": "830C46727D9278EAE212AE3ECA44EEB9E71B2A68704E95F344A64FBA7B1963F5",
+  "installedUtc": "2026-11-07T07:00:00Z",
+  "payloadSubpath": "mariadb-11.8.9-winx64",
+  "entrySubpath": "mariadb-11.8.9-winx64\\bin\\mariadbd.exe",
+  "entrySha256": "DE2C4350E36BCDFF6A18B614A21701A8A827509F44F51274411BB52A2849F9E5",
+  "criticalFiles": [
+    {
+      "path": "mariadb-11.8.9-winx64\\bin\\mariadbd.exe",
+      "sha256": "DE2C4350E36BCDFF6A18B614A21701A8A827509F44F51274411BB52A2849F9E5"
+    },
+    {
+      "path": "mariadb-11.8.9-winx64\\bin\\mariadb-install-db.exe",
+      "sha256": "4ACB5FEBEEE0613A96A6FC8906DA2FEE002D4A7C820804297719F8A0596AC1BF"
+    },
+    {
+      "path": "mariadb-11.8.9-winx64\\bin\\mariadb-admin.exe",
+      "sha256": "C2E25266DDBDF24A42D2EEF38A3D0C74EEF28DCBE5DF0A08E747092B183F8FCC"
+    },
+    {
+      "path": "mariadb-11.8.9-winx64\\bin\\mariadb.exe",
+      "sha256": "A093362874408AA721D0A29DE26CCE74DEB35DCE50F7302F3C65586EC7E14500"
+    },
+    {
+      "path": "mariadb-11.8.9-winx64\\bin\\server.dll",
+      "sha256": "3158A7E97FF78C44C42DD0662C13A855F3EB73609B0E5F054F397F10131896F2"
+    }
+  ]
+}

@@ -1,0 +1,897 @@
+// ============================================================================
+// KR Unified Language - Module: Network (WinSock2 Sockets, HTTP Router & Server)
+// Language: C++20 (Memory Buffers, Concurrency, Socket Lifecycle & Dispatch)
+// ============================================================================
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <chrono>
+#include <functional>
+#include <cstring>
+#include <cstdlib>
+#include <climits>
+#include <fstream>
+#include <algorithm>
+#include <cctype>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+// Cross-language ABI function declarations provided by KR Bridge
+extern "C" {
+    // Protocol (Rust)
+    bool rust_http_validate_header(uint64_t name_ptr, int32_t name_len, uint64_t val_ptr, int32_t val_len);
+    int32_t rust_sanitize_path(uint64_t in_ptr, int32_t in_len, uint64_t out_ptr, int32_t max_out);
+    int32_t rust_http_parse_request(uint64_t raw_ptr, int32_t raw_len, uint64_t out_method, int32_t max_method, uint64_t out_path, int32_t max_path, uint64_t out_version, int32_t max_version, uint64_t out_meta, uint64_t out_auth_bearer, int32_t max_auth, uint64_t out_ws_key, int32_t max_ws_key);
+    int32_t rust_ws_compute_accept_key(uint64_t sec_ws_key, int32_t key_len, uint64_t out_buf, int32_t max_len);
+    int32_t rust_ws_parse_frame_header(uint64_t buf, int32_t len, uint64_t out_info);
+    int32_t rust_ws_apply_mask(uint64_t data, int32_t len, uint32_t mask_key);
+    int32_t rust_ws_build_frame_header(int32_t opcode, int64_t payload_len, uint64_t out_buf, int32_t max_out);
+
+    // Security (Rust & Go)
+    int32_t rust_sha256(uint64_t data, int32_t len, uint64_t out_digest);
+    int32_t rust_hmac_sha256(uint64_t key, int32_t key_len, uint64_t data, int32_t data_len, uint64_t out_mac);
+    bool rust_constant_time_compare(uint64_t a, int32_t a_len, uint64_t b, int32_t b_len);
+    int32_t rust_jwt_create(uint64_t secret, int32_t sec_len, uint64_t sub, int32_t sub_len, uint64_t role, int32_t role_len, int64_t exp_sec, uint64_t out_buf, int32_t max_out);
+    int32_t rust_jwt_verify(uint64_t token, int32_t tok_len, uint64_t secret, int32_t sec_len, int64_t current_time_sec, uint64_t out_sub, int32_t max_sub);
+    bool rust_token_bucket_consume(uint64_t bucket_id, int32_t max_tokens, double refill_per_sec, double now_sec);
+    bool go_security_audit_environment(void);
+    bool go_jwt_is_blacklisted(int64_t jtiId);
+    bool go_jwt_revoke_token(int64_t jtiId);
+
+    // Orchestration (Go)
+    bool go_admission_init(int32_t maxConns);
+    bool go_admission_acquire(void);
+    void go_admission_release(void);
+    int32_t go_get_active_conns(void);
+    bool go_task_init(int32_t workers, int32_t queueCap);
+    bool go_task_enqueue(int32_t taskType, int64_t payloadId);
+    int64_t go_task_get_processed(void);
+    int32_t go_task_get_queue_len(void);
+    bool go_eventhub_publish(int32_t topicId, int64_t eventVal);
+    int32_t go_eventhub_subscribe(int32_t topicId);
+    int64_t go_eventhub_published_count(void);
+    int32_t go_eventhub_subscribers_count(void);
+    void go_record_request(int32_t statusCode, int64_t latencyMicros);
+    int64_t go_metrics_total_requests(void);
+    double go_metrics_average_latency_us(void);
+    int64_t go_metrics_error_count(void);
+
+    // Optional PHP/CMS runtime (C++)
+    bool cpp_php_module_init(void);
+    bool cpp_php_module_enabled(void);
+    int32_t cpp_php_handle_request(
+        uint64_t method_ptr, int32_t method_len,
+        uint64_t target_ptr, int32_t target_len,
+        uint64_t headers_ptr, int32_t headers_len,
+        uint64_t body_ptr, int32_t body_len,
+        uint64_t out_status_ptr,
+        uint64_t out_content_type_ptr, int32_t max_content_type,
+        uint64_t out_headers_ptr, int32_t max_headers,
+        uint64_t out_body_ptr, int32_t max_body);
+}
+
+static std::atomic<bool> g_server_running{false};
+static std::atomic<int32_t> g_active_websockets{0};
+static int32_t g_max_websockets = 1;
+static std::string g_jwt_secret;
+static std::string g_bootstrap_token;
+
+static bool cpp_send_all(SOCKET socket, const char* data, size_t length) {
+    size_t sent_total = 0;
+    while (sent_total < length) {
+        size_t remaining = length - sent_total;
+        int chunk = remaining > 0x7fffffffU ? 0x7fffffff : static_cast<int>(remaining);
+        int sent = send(socket, data + sent_total, chunk, 0);
+        if (sent <= 0) return false;
+        sent_total += static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static bool cpp_constant_time_equal(const std::string& left, const char* right) {
+    if (right == nullptr) return false;
+    size_t right_len = strlen(right);
+    if (left.size() != right_len || right_len > static_cast<size_t>(INT32_MAX)) return false;
+    return rust_constant_time_compare(
+        reinterpret_cast<uint64_t>(left.data()), static_cast<int32_t>(left.size()),
+        reinterpret_cast<uint64_t>(right), static_cast<int32_t>(right_len));
+}
+
+static std::string cpp_json_escape(const std::string& value) {
+    static const char hex[] = "0123456789abcdef";
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (unsigned char c : value) {
+        switch (c) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    escaped += "\\u00";
+                    escaped.push_back(hex[(c >> 4) & 0x0f]);
+                    escaped.push_back(hex[c & 0x0f]);
+                } else {
+                    escaped.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    return escaped;
+}
+
+static bool cpp_verify_access_token(const char* token, std::string& subject) {
+    if (token == nullptr || token[0] == '\0' || g_jwt_secret.empty()) return false;
+    char sub_buf[128] = {0};
+    auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    int32_t result = rust_jwt_verify(
+        reinterpret_cast<uint64_t>(token), static_cast<int32_t>(strlen(token)),
+        reinterpret_cast<uint64_t>(g_jwt_secret.data()), static_cast<int32_t>(g_jwt_secret.size()),
+        now_ts, reinterpret_cast<uint64_t>(sub_buf), sizeof(sub_buf));
+    if (result <= 0) return false;
+    subject.assign(sub_buf, static_cast<size_t>(result));
+    return true;
+}
+
+struct HttpResponse {
+    int status;
+    std::string content_type;
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> headers;
+};
+
+static std::string cpp_build_http_response(const HttpResponse& resp, bool keep_alive) {
+    std::ostringstream ss;
+    std::string status_msg = "OK";
+    if (resp.status == 200) status_msg = "OK";
+    else if (resp.status == 201) status_msg = "Created";
+    else if (resp.status == 202) status_msg = "Accepted";
+    else if (resp.status == 204) status_msg = "No Content";
+    else if (resp.status == 301) status_msg = "Moved Permanently";
+    else if (resp.status == 302) status_msg = "Found";
+    else if (resp.status == 303) status_msg = "See Other";
+    else if (resp.status == 304) status_msg = "Not Modified";
+    else if (resp.status == 307) status_msg = "Temporary Redirect";
+    else if (resp.status == 308) status_msg = "Permanent Redirect";
+    else if (resp.status == 400) status_msg = "Bad Request";
+    else if (resp.status == 408) status_msg = "Request Timeout";
+    else if (resp.status == 401) status_msg = "Unauthorized";
+    else if (resp.status == 403) status_msg = "Forbidden";
+    else if (resp.status == 404) status_msg = "Not Found";
+    else if (resp.status == 405) status_msg = "Method Not Allowed";
+    else if (resp.status == 413) status_msg = "Content Too Large";
+    else if (resp.status == 422) status_msg = "Unprocessable Content";
+    else if (resp.status == 429) status_msg = "Too Many Requests";
+    else if (resp.status == 500) status_msg = "Internal Server Error";
+    else if (resp.status == 503) status_msg = "Service Unavailable";
+    else if (resp.status == 504) status_msg = "Gateway Timeout";
+
+    ss << "HTTP/1.1 " << resp.status << " " << status_msg << "\r\n";
+    ss << "Server: Sovereign-KR\r\n";
+    ss << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
+    std::string safe_content_type = resp.content_type;
+    if (!rust_http_validate_header((uint64_t)"Content-Type", 12,
+                                   (uint64_t)safe_content_type.data(), (int32_t)safe_content_type.size())) {
+        safe_content_type = "application/octet-stream";
+    }
+    ss << "Content-Type: " << safe_content_type << "\r\n";
+    ss << "Content-Length: " << resp.body.size() << "\r\n";
+
+    // Sovereign Paranoid Security Headers
+    ss << "X-Content-Type-Options: nosniff\r\n";
+    ss << "X-Frame-Options: DENY\r\n";
+    ss << "Referrer-Policy: no-referrer\r\n";
+    ss << "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:*; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'\r\n";
+    ss << "Cache-Control: no-store\r\n";
+    ss << "Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n";
+
+    for (const auto& h : resp.headers) {
+        if (rust_http_validate_header((uint64_t)h.first.data(), (int32_t)h.first.size(),
+                                      (uint64_t)h.second.data(), (int32_t)h.second.size())) {
+            ss << h.first << ": " << h.second << "\r\n";
+        }
+    }
+
+    ss << "\r\n";
+    ss << resp.body;
+    return ss.str();
+}
+
+static bool cpp_append_php_response_headers(const char* raw_headers, HttpResponse& response) {
+    if (raw_headers == nullptr) return false;
+    std::string raw(raw_headers);
+    size_t position = 0;
+    while (position < raw.size()) {
+        size_t end = raw.find("\r\n", position);
+        if (end == std::string::npos) return false;
+        if (end == position) { position = end + 2; continue; }
+        std::string line = raw.substr(position, end - position);
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) return false;
+        std::string name = line.substr(0, colon);
+        std::string value = line.substr(colon + 1);
+        while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+        if (!rust_http_validate_header((uint64_t)name.data(), (int32_t)name.size(),
+                                       (uint64_t)value.data(), (int32_t)value.size())) return false;
+        std::string lower_name = name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (lower_name == "connection" || lower_name == "content-length" ||
+            lower_name == "content-type" || lower_name == "transfer-encoding" ||
+            lower_name == "keep-alive" || lower_name == "trailer" || lower_name == "te" ||
+            lower_name == "upgrade" || lower_name == "server" || lower_name == "x-powered-by") return false;
+        response.headers.emplace_back(std::move(name), std::move(value));
+        position = end + 2;
+    }
+    return true;
+}
+
+static void cpp_handle_websocket_connection(SOCKET client, const std::string& ws_key) {
+    char accept_buf[64] = {0};
+    int32_t acc_len = rust_ws_compute_accept_key(
+        (uint64_t)ws_key.data(),
+        (int32_t)ws_key.size(),
+        (uint64_t)accept_buf,
+        sizeof(accept_buf)
+    );
+
+    if (acc_len <= 0) {
+        return;
+    }
+
+    std::ostringstream ws_resp;
+    ws_resp << "HTTP/1.1 101 Switching Protocols\r\n";
+    ws_resp << "Upgrade: websocket\r\n";
+    ws_resp << "Connection: Upgrade\r\n";
+    ws_resp << "Sec-WebSocket-Accept: " << accept_buf << "\r\n";
+    ws_resp << "Sec-WebSocket-Version: 13\r\n\r\n";
+
+    std::string handshake_str = ws_resp.str();
+    if (!cpp_send_all(client, handshake_str.data(), handshake_str.size())) return;
+
+    // Publish WebSocket connection event to Go EventHub
+    go_eventhub_publish(100, 1);
+
+    // Read WebSocket frames
+    char buf[4096];
+    const auto websocket_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    int32_t frames_seen = 0;
+    while (g_server_running.load() && frames_seen < 1000 &&
+           std::chrono::steady_clock::now() < websocket_deadline) {
+        int n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        frames_seen++;
+
+        uint8_t frame_info[17] = {0};
+        int32_t hdr_size = rust_ws_parse_frame_header(
+            (uint64_t)buf,
+            n,
+            (uint64_t)frame_info
+        );
+
+        if (hdr_size < 0) break;
+
+        int32_t opcode = 0;
+        int64_t payload_len = 0;
+        uint32_t mask = 0;
+        std::memcpy(&opcode, frame_info + 1, sizeof(opcode));
+        std::memcpy(&payload_len, frame_info + 5, sizeof(payload_len));
+        std::memcpy(&mask, frame_info + 13, sizeof(mask));
+
+        // A frame must be completely contained in the bounded receive buffer.
+        // Never use the peer-declared length until it has been checked against
+        // the bytes actually received.
+        if (payload_len < 0 || payload_len > 4096 ||
+            hdr_size > n || payload_len > static_cast<int64_t>(n - hdr_size)) {
+            break;
+        }
+
+        if (opcode == 8) {
+            // Close frame
+            break;
+        } else if (opcode == 9) {
+            // Ping frame -> Send Pong
+            uint8_t pong_hdr[10];
+            int32_t ph_len = rust_ws_build_frame_header(10, payload_len, (uint64_t)pong_hdr, sizeof(pong_hdr));
+            if (ph_len <= 0 || !cpp_send_all(client, reinterpret_cast<const char*>(pong_hdr), static_cast<size_t>(ph_len))) break;
+            if (payload_len > 0) {
+                rust_ws_apply_mask((uint64_t)(buf + hdr_size), (int32_t)payload_len, mask);
+                if (!cpp_send_all(client, buf + hdr_size, static_cast<size_t>(payload_len))) break;
+            }
+        } else if (opcode == 1 || opcode == 2) {
+            // Text or Binary -> Echo frame back to client
+            if (payload_len > 0 && n >= hdr_size + payload_len) {
+                rust_ws_apply_mask((uint64_t)(buf + hdr_size), (int32_t)payload_len, mask);
+            }
+
+            uint8_t echo_hdr[10];
+            int32_t eh_len = rust_ws_build_frame_header(opcode, payload_len, (uint64_t)echo_hdr, sizeof(echo_hdr));
+            if (eh_len <= 0 || !cpp_send_all(client, reinterpret_cast<const char*>(echo_hdr), static_cast<size_t>(eh_len))) break;
+            if (payload_len > 0) {
+                if (!cpp_send_all(client, buf + hdr_size, static_cast<size_t>(payload_len))) break;
+            }
+        }
+    }
+}
+
+static void cpp_handle_client_socket(SOCKET client, sockaddr_in client_addr) {
+    uint64_t client_ip_hash = static_cast<uint64_t>(client_addr.sin_addr.s_addr);
+    bool keep_alive = true;
+    int requests_handled = 0;
+
+    // Timeout settings (5 seconds)
+    DWORD timeout_ms = 5000;
+    if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms)) == SOCKET_ERROR ||
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms)) == SOCKET_ERROR) {
+        closesocket(client);
+        go_admission_release();
+        return;
+    }
+
+    const auto connection_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+
+    while (keep_alive && requests_handled < 100 && g_server_running.load()) {
+        if (std::chrono::steady_clock::now() >= connection_deadline) break;
+        std::string request_data;
+        std::string request_headers;
+        std::string request_body;
+        request_data.reserve(8192);
+        bool request_complete = false;
+        const auto header_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (request_data.size() < 8191) {
+            auto header_now = std::chrono::steady_clock::now();
+            if (header_now >= header_deadline) break;
+            auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(header_deadline - header_now).count();
+            DWORD bounded_timeout = static_cast<DWORD>(remaining_ms > 5000 ? 5000 : (remaining_ms < 1 ? 1 : remaining_ms));
+            if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                           reinterpret_cast<const char*>(&bounded_timeout), sizeof(bounded_timeout)) == SOCKET_ERROR) {
+                break;
+            }
+            char chunk[2048];
+            size_t capacity = 8191 - request_data.size();
+            int wanted = static_cast<int>(capacity < sizeof(chunk) ? capacity : sizeof(chunk));
+            int received = recv(client, chunk, wanted, 0);
+            if (received <= 0) break;
+            request_data.append(chunk, static_cast<size_t>(received));
+            if (std::chrono::steady_clock::now() >= header_deadline) break;
+            size_t header_end = request_data.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                request_headers = request_data.substr(0, header_end + 4);
+                request_body = request_data.substr(header_end + 4);
+                request_complete = true;
+                break;
+            }
+        }
+        if (!request_complete) {
+            HttpResponse resp{400, "application/json", "{\"error\":\"Incomplete or oversized HTTP request\"}", {}};
+            std::string raw = cpp_build_http_response(resp, false);
+            cpp_send_all(client, raw.data(), raw.size());
+            break;
+        }
+        if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms)) == SOCKET_ERROR) {
+            break;
+        }
+
+        auto start_time = std::chrono::steady_clock::now();
+
+        char method[32] = {0};
+        char path[512] = {0};
+        char version[32] = {0};
+        uint8_t meta[16] = {0};
+        char auth_bearer[512] = {0};
+        char ws_key[128] = {0};
+
+        int32_t parse_res = rust_http_parse_request(
+            (uint64_t)request_headers.data(),
+            static_cast<int32_t>(request_headers.size()),
+            (uint64_t)method, sizeof(method),
+            (uint64_t)path, sizeof(path),
+            (uint64_t)version, sizeof(version),
+            (uint64_t)meta,
+            (uint64_t)auth_bearer, sizeof(auth_bearer),
+            (uint64_t)ws_key, sizeof(ws_key)
+        );
+
+        if (parse_res != 0) {
+            HttpResponse resp{400, "application/json", "{\"error\":\"Malformed HTTP Request\"}", {}};
+            std::string raw = cpp_build_http_response(resp, false);
+            cpp_send_all(client, raw.data(), raw.size());
+            break;
+        }
+
+        bool req_keep_alive = (meta[0] != 0);
+        bool is_ws = (meta[1] != 0);
+        int64_t content_length = 0;
+        std::memcpy(&content_length, meta + 2, sizeof(content_length));
+        if (content_length < 0 || content_length > 16LL * 1024 * 1024 ||
+            request_body.size() > static_cast<size_t>(content_length)) {
+            HttpResponse resp{400, "application/json", "{\"error\":\"Invalid HTTP message framing\"}", {}};
+            std::string raw = cpp_build_http_response(resp, false);
+            cpp_send_all(client, raw.data(), raw.size());
+            break;
+        }
+        const auto body_deadline = std::min(connection_deadline,
+            std::chrono::steady_clock::now() + std::chrono::seconds(30));
+        request_body.reserve(static_cast<size_t>(content_length));
+        while (request_body.size() < static_cast<size_t>(content_length)) {
+            auto body_now = std::chrono::steady_clock::now();
+            if (body_now >= body_deadline) break;
+            auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(body_deadline - body_now).count();
+            DWORD bounded_timeout = static_cast<DWORD>(remaining_ms > 5000 ? 5000 : (remaining_ms < 1 ? 1 : remaining_ms));
+            if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                           reinterpret_cast<const char*>(&bounded_timeout), sizeof(bounded_timeout)) == SOCKET_ERROR) break;
+            char body_chunk[16384];
+            size_t remaining = static_cast<size_t>(content_length) - request_body.size();
+            int wanted = static_cast<int>(std::min<size_t>(remaining, sizeof(body_chunk)));
+            int received = recv(client, body_chunk, wanted, 0);
+            if (received <= 0) break;
+            request_body.append(body_chunk, static_cast<size_t>(received));
+        }
+        if (request_body.size() != static_cast<size_t>(content_length)) {
+            HttpResponse resp{408, "application/json", "{\"error\":\"Incomplete HTTP request body\"}", {}};
+            std::string raw = cpp_build_http_response(resp, false);
+            cpp_send_all(client, raw.data(), raw.size());
+            break;
+        }
+        if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms)) == SOCKET_ERROR) break;
+        // Token bucket rate limiting (100 requests capacity, 20 refill per second)
+        auto now_sec = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (!rust_token_bucket_consume(client_ip_hash, 100, 20.0, now_sec)) {
+            HttpResponse resp{429, "application/json", "{\"error\":\"Too Many Requests - Rate Limit Exceeded\"}", {}};
+            std::string raw = cpp_build_http_response(resp, false);
+            cpp_send_all(client, raw.data(), raw.size());
+            break;
+        }
+
+        // WebSocket Upgrade
+        if (is_ws && std::string(path) == "/ws") {
+            std::string ws_subject;
+            if (!cpp_verify_access_token(auth_bearer, ws_subject)) {
+                HttpResponse denied{401, "application/json", "{\"error\":\"Valid access token required for WebSocket upgrade\"}", {}};
+                std::string raw = cpp_build_http_response(denied, false);
+                cpp_send_all(client, raw.data(), raw.size());
+                break;
+            }
+            int32_t active = g_active_websockets.load(std::memory_order_relaxed);
+            while (active < g_max_websockets &&
+                   !g_active_websockets.compare_exchange_weak(active, active + 1, std::memory_order_acquire)) {}
+            if (active >= g_max_websockets) {
+                HttpResponse busy{503, "application/json", "{\"error\":\"WebSocket capacity reached\"}", {}};
+                std::string raw = cpp_build_http_response(busy, false);
+                cpp_send_all(client, raw.data(), raw.size());
+                break;
+            }
+            struct WebSocketRelease {
+                ~WebSocketRelease() { g_active_websockets.fetch_sub(1, std::memory_order_release); }
+            } websocket_release;
+            cpp_handle_websocket_connection(client, ws_key);
+            break; // WebSocket takes over socket
+        }
+
+        // Sanitize path against directory traversal
+        char clean_path[512] = {0};
+        int32_t clean_len = rust_sanitize_path(
+            (uint64_t)path,
+            (int32_t)strlen(path),
+            (uint64_t)clean_path,
+            sizeof(clean_path)
+        );
+
+        if (clean_len <= 0) {
+            HttpResponse bad_path{400, "application/json", "{\"error\":\"Invalid request path\"}", {}};
+            std::string raw = cpp_build_http_response(bad_path, false);
+            cpp_send_all(client, raw.data(), raw.size());
+            break;
+        }
+
+        HttpResponse resp;
+        std::string s_method(method);
+        std::string s_path(clean_path);
+
+        // Routing Engine
+        bool internal_path = s_path == "/health" || s_path == "/auth/token" ||
+                             s_path == "/api/secure" || s_path == "/api/tasks" ||
+                             s_path == "/api/eventhub/stats" || s_path == "/ws";
+        bool internal_method_valid =
+            ((s_path == "/health" || s_path == "/api/secure" ||
+              s_path == "/api/eventhub/stats" || s_path == "/ws") && s_method == "GET") ||
+            ((s_path == "/auth/token" || s_path == "/api/tasks") && s_method == "POST");
+        if (internal_path && !request_body.empty()) {
+            resp.status = 400;
+            resp.content_type = "application/json";
+            resp.body = "{\"error\":\"Request body is not accepted by this endpoint\"}";
+        } else if (internal_path && !internal_method_valid) {
+            resp.status = 405;
+            resp.content_type = "application/json";
+            resp.body = "{\"error\":\"Method not allowed for reserved endpoint\"}";
+        } else if (s_path == "/ws") {
+            resp.status = 400;
+            resp.content_type = "application/json";
+            resp.body = "{\"error\":\"Valid WebSocket upgrade required\"}";
+        } else if (s_path == "/" && s_method == "GET" && !cpp_php_module_enabled()) {
+            resp.status = 200;
+            resp.content_type = "text/html; charset=utf-8";
+            resp.body =
+                "<!doctype html><html><head><title>Sovereign Server V10 KR</title>"
+                "<style>body{font-family:sans-serif;background:#0f172a;color:#f8fafc;padding:2rem;}"
+                ".card{background:#1e293b;border-radius:8px;padding:1.5rem;max-width:800px;margin:auto;box-shadow:0 4px 6px -1px rgba(0,0,0,0.5);}"
+                "h1{color:#38bdf8;}span.badge{background:#0284c7;padding:4px 8px;border-radius:4px;font-size:0.85rem;margin-right:8px;}"
+                "code{background:#334155;padding:2px 6px;border-radius:4px;color:#f472b6;}</style></head>"
+                "<body><div class='card'>"
+                "<h1>Sovereign Server V10 Professional (KR Multi-Language)</h1>"
+                "<p><span class='badge'>C++20</span> High-Speed Network Sockets & Lifecycle</p>"
+                "<p><span class='badge'>Rust</span> Cryptographic Kernels, JWT & Protocol Parser</p>"
+                "<p><span class='badge'>Go</span> Concurrency, Task Queue & EventHub Broker</p>"
+                "<hr style='border-color:#334155;'/>"
+                "<h3>Endpoints:</h3>"
+                "<ul>"
+                "<li><code>GET /health</code> - Server health & performance metrics</li>"
+                "<li><code>POST /auth/token</code> - Issue cryptographic HMAC-SHA256 JWT</li>"
+                "<li><code>GET /api/secure</code> - Authenticated endpoint (Bearer token)</li>"
+                "<li><code>POST /api/tasks</code> - Dispatch async task to Go queue</li>"
+                "<li><code>GET /api/eventhub/stats</code> - Pub/Sub broker statistics</li>"
+                "<li><code>WS /ws</code> - Interactive RFC 6455 WebSocket stream</li>"
+                "</ul></div></body></html>";
+        } else if (s_path == "/health" && s_method == "GET") {
+            int64_t total_req = go_metrics_total_requests();
+            double avg_lat = go_metrics_average_latency_us();
+            int64_t err_count = go_metrics_error_count();
+            int32_t active_conns = go_get_active_conns();
+            int64_t tasks_done = go_task_get_processed();
+
+            std::ostringstream json;
+            json << "{\"status\":\"healthy\","
+                 << "\"active_connections\":" << active_conns << ","
+                 << "\"total_requests\":" << total_req << ","
+                 << "\"average_latency_us\":" << avg_lat << ","
+                 << "\"error_count\":" << err_count << ","
+                 << "\"background_tasks_processed\":" << tasks_done << ","
+                 << "\"multi_language\":{\"network\":\"C++20\",\"crypto\":\"Rust\",\"orchestration\":\"Go\"}}";
+
+            resp.status = 200;
+            resp.content_type = "application/json";
+            resp.body = json.str();
+        } else if (s_path == "/auth/token" && s_method == "POST") {
+            if (!cpp_constant_time_equal(g_bootstrap_token, auth_bearer)) {
+                resp.status = 401;
+                resp.content_type = "application/json";
+                resp.body = "{\"error\":\"Valid bootstrap bearer token required\"}";
+            } else {
+            char token_buf[512] = {0};
+            auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            int64_t exp = now_ts + 3600; // 1 hour validity
+
+            std::string user = "admin";
+            std::string role = "sovereign_operator";
+
+            int32_t t_len = rust_jwt_create(
+                (uint64_t)g_jwt_secret.data(), (int32_t)g_jwt_secret.size(),
+                (uint64_t)user.data(), (int32_t)user.size(),
+                (uint64_t)role.data(), (int32_t)role.size(),
+                exp,
+                (uint64_t)token_buf, sizeof(token_buf)
+            );
+
+            if (t_len > 0) {
+                resp.status = 200;
+                resp.content_type = "application/json";
+                resp.body = std::string("{\"token\":\"") + token_buf + "\",\"expires_at\":" + std::to_string(exp) + "}";
+            } else {
+                resp.status = 500;
+                resp.content_type = "application/json";
+                resp.body = "{\"error\":\"Token generation failed\"}";
+            }
+            }
+        } else if (s_path == "/api/secure" && s_method == "GET") {
+            if (strlen(auth_bearer) == 0) {
+                resp.status = 401;
+                resp.content_type = "application/json";
+                resp.body = "{\"error\":\"Missing Bearer Token in Authorization header\"}";
+            } else {
+                std::string subject;
+                bool token_valid = cpp_verify_access_token(auth_bearer, subject);
+
+                if (token_valid) {
+                    resp.status = 200;
+                    resp.content_type = "application/json";
+                    resp.body = std::string("{\"message\":\"Access granted to sovereign zone\",\"subject\":\"") + cpp_json_escape(subject) + "\"}";
+                } else {
+                    resp.status = 403;
+                    resp.content_type = "application/json";
+                    resp.body = "{\"error\":\"Forbidden: Invalid or expired cryptographic token\"}";
+                }
+            }
+        } else if (s_path == "/api/tasks" && s_method == "POST") {
+            std::string subject;
+            if (!cpp_verify_access_token(auth_bearer, subject)) {
+                resp.status = 401;
+                resp.content_type = "application/json";
+                resp.body = "{\"error\":\"Valid access token required\"}";
+            } else {
+            static std::atomic<int64_t> task_id_counter{1000};
+            int64_t pid = ++task_id_counter;
+            bool enq = go_task_enqueue(1, pid);
+            if (enq) {
+                resp.status = 202;
+                resp.content_type = "application/json";
+                resp.body = "{\"status\":\"Accepted\",\"task_id\":" + std::to_string(pid) + "}";
+            } else {
+                resp.status = 503;
+                resp.content_type = "application/json";
+                resp.body = "{\"error\":\"Task Queue Full\"}";
+            }
+            }
+        } else if (s_path == "/api/eventhub/stats" && s_method == "GET") {
+            int64_t published = go_eventhub_published_count();
+            int32_t subs = go_eventhub_subscribers_count();
+
+            resp.status = 200;
+            resp.content_type = "application/json";
+            resp.body = "{\"events_published\":" + std::to_string(published) + ",\"active_subscribers\":" + std::to_string(subs) + "}";
+        } else if (cpp_php_module_enabled()) {
+            try {
+                constexpr int32_t php_body_capacity = 16 * 1024 * 1024;
+                std::vector<char> php_body(static_cast<size_t>(php_body_capacity));
+                char php_content_type[256] = {0};
+                char php_headers[8193] = {0};
+                int32_t php_status = 500;
+                int32_t php_result = cpp_php_handle_request(
+                    reinterpret_cast<uint64_t>(s_method.data()), static_cast<int32_t>(s_method.size()),
+                    reinterpret_cast<uint64_t>(path), static_cast<int32_t>(strlen(path)),
+                    reinterpret_cast<uint64_t>(request_headers.data()), static_cast<int32_t>(request_headers.size()),
+                    request_body.empty() ? 0 : reinterpret_cast<uint64_t>(request_body.data()),
+                    static_cast<int32_t>(request_body.size()), reinterpret_cast<uint64_t>(&php_status),
+                    reinterpret_cast<uint64_t>(php_content_type), sizeof(php_content_type),
+                    reinterpret_cast<uint64_t>(php_headers), sizeof(php_headers),
+                    reinterpret_cast<uint64_t>(php_body.data()), php_body_capacity);
+                if (php_result >= 0) {
+                    resp.status = php_status;
+                    resp.content_type = php_content_type;
+                    resp.body.assign(php_body.data(), static_cast<size_t>(php_result));
+                    if (!cpp_append_php_response_headers(php_headers, resp)) {
+                        resp = HttpResponse{500, "application/json", "{\"error\":\"Invalid PHP response headers\"}", {}};
+                    }
+                } else {
+                    int mapped = -php_result;
+                    if (mapped != 400 && mapped != 403 && mapped != 404 && mapped != 405 &&
+                        mapped != 413 && mapped != 500 && mapped != 503 && mapped != 504) mapped = 500;
+                    resp.status = mapped;
+                    resp.content_type = "application/json";
+                    resp.body = "{\"error\":\"PHP gateway request failed\"}";
+                }
+            } catch (...) {
+                resp = HttpResponse{503, "application/json", "{\"error\":\"PHP gateway resource allocation failed\"}", {}};
+            }
+        } else {
+            resp.status = 404;
+            resp.content_type = "application/json";
+            resp.body = "{\"error\":\"Not Found\",\"path\":\"" + cpp_json_escape(s_path) + "\"}";
+        }
+
+        keep_alive = req_keep_alive;
+        std::string raw_resp = cpp_build_http_response(resp, keep_alive);
+        if (!cpp_send_all(client, raw_resp.data(), raw_resp.size())) break;
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto lat_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        go_record_request(resp.status, lat_us);
+
+        requests_handled++;
+    }
+
+    closesocket(client);
+    go_admission_release();
+}
+
+class SovereignThreadPool {
+public:
+    explicit SovereignThreadPool(size_t threads, size_t max_pending = 1024)
+        : stop_(false), max_pending_(max_pending) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers_.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex_);
+                        this->cv_.wait(lock, [this] {
+                            return this->stop_ || !this->tasks_.empty();
+                        });
+                        if (this->stop_ && this->tasks_.empty()) {
+                            return;
+                        }
+                        task = std::move(this->tasks_.front());
+                        this->tasks_.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    bool enqueue(std::function<void()> task) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            if (stop_ || tasks_.size() >= max_pending_) return false;
+            tasks_.push(task);
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    ~SovereignThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+    bool stop_;
+    const size_t max_pending_;
+};
+
+int cpp_start_server(const char* host, int port, int worker_count) {
+    const char* jwt_secret = std::getenv("SOVEREIGN_JWT_SECRET");
+    const char* bootstrap_token = std::getenv("SOVEREIGN_BOOTSTRAP_TOKEN");
+    if (jwt_secret == nullptr || bootstrap_token == nullptr ||
+        strlen(jwt_secret) < 32 || strlen(bootstrap_token) < 32 ||
+        strlen(jwt_secret) > 256 || strlen(bootstrap_token) > 256 ||
+        strcmp(jwt_secret, bootstrap_token) == 0) {
+        std::cerr << "[CRITICAL] Set distinct SOVEREIGN_JWT_SECRET and "
+                     "SOVEREIGN_BOOTSTRAP_TOKEN values (32-256 bytes each)." << std::endl;
+        return 1;
+    }
+    g_jwt_secret.assign(jwt_secret);
+    g_bootstrap_token.assign(bootstrap_token);
+
+    // The implementation has no TLS stack.  Bind only to loopback so bearer
+    // credentials cannot traverse an unencrypted network.  A local TLS reverse
+    // proxy can safely expose the service when required.
+    if (host == nullptr || strcmp(host, "127.0.0.1") != 0) {
+        std::cerr << "[CRITICAL] Only 127.0.0.1 is allowed; use a local TLS reverse proxy for remote access." << std::endl;
+        return 1;
+    }
+    if (port < 1 || port > 65535 || worker_count < 1 || worker_count > 256) {
+        std::cerr << "[CRITICAL] Invalid port or worker count (allowed workers: 1-256)." << std::endl;
+        return 1;
+    }
+    if (!cpp_php_module_init()) {
+        std::cerr << "[CRITICAL] PHP module configuration is invalid; refusing to start." << std::endl;
+        return 1;
+    }
+    g_max_websockets = std::max(1, worker_count / 2);
+    WSADATA wsaData;
+    int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (wsa_err != 0) {
+        std::cerr << "[CRITICAL] WSAStartup failed: " << wsa_err << std::endl;
+        return 1;
+    }
+
+    SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_sock == INVALID_SOCKET) {
+        std::cerr << "[CRITICAL] socket creation failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return 1;
+    }
+
+    BOOL exclusive = TRUE;
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) == SOCKET_ERROR) {
+        std::cerr << "[CRITICAL] Failed to enable exclusive address use: " << WSAGetLastError() << std::endl;
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons((u_short)port);
+    if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) != 1) {
+        std::cerr << "[CRITICAL] Failed to configure loopback bind address." << std::endl;
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    if (bind(listen_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        std::cerr << "[CRITICAL] Bind failed on " << host << ":" << port << " - Error: " << err;
+        if (err == 10013 || err == 10048) {
+            std::cerr << " (Port " << port << " ist bereits durch einen anderen Dienst belegt, z.B. Apache/httpd. Bitte anderen Port waehlen via --port <nummer>, z.B. --port 8085)";
+        }
+        std::cerr << std::endl;
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    if (listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
+        std::cerr << "[CRITICAL] Listen failed: " << WSAGetLastError() << std::endl;
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    std::cout << "=================================================================" << std::endl;
+    std::cout << "  Sovereign Server V10 Professional (KR Multi-Language Fusion)" << std::endl;
+    std::cout << "  C++20 (Networking) + Rust (Crypto/Protocol) + Go (Orchestration)" << std::endl;
+    std::cout << "=================================================================" << std::endl;
+    std::cout << "  Server bound and listening on http://" << host << ":" << port << std::endl;
+    std::cout << "  Worker Threads: " << worker_count << std::endl;
+    std::cout << "  PHP/CMS module: " << (cpp_php_module_enabled() ? "enabled" : "disabled") << std::endl;
+    std::cout << "  Press CTRL+C to gracefully stop the server." << std::endl;
+    std::cout << "-----------------------------------------------------------------" << std::endl;
+
+    g_server_running = true;
+    const int32_t max_admitted = static_cast<int32_t>(worker_count * 3);
+    if (!go_admission_init(max_admitted) || !go_task_init(worker_count, 4096)) {
+        std::cerr << "[CRITICAL] Failed to initialize bounded Go runtime resources." << std::endl;
+        closesocket(listen_sock);
+        WSACleanup();
+        return 1;
+    }
+
+    SovereignThreadPool pool(static_cast<size_t>(worker_count), static_cast<size_t>(worker_count * 2));
+
+    while (g_server_running.load()) {
+        sockaddr_in client_addr{};
+        int client_len = sizeof(client_addr);
+        SOCKET client = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
+
+        if (client == INVALID_SOCKET) {
+            if (!g_server_running.load()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        // Admission happens at the socket boundary, before a peer can occupy
+        // the pending queue. Capacity covers active workers plus a short,
+        // worker-proportional backlog only.
+        if (!go_admission_acquire()) {
+            // Do not perform a blocking send on an unadmitted socket: a peer
+            // that never reads must not be able to stall the accept loop.
+            closesocket(client);
+            continue;
+        }
+
+        if (!pool.enqueue([client, client_addr]() {
+                cpp_handle_client_socket(client, client_addr);
+            })) {
+            go_admission_release();
+            closesocket(client);
+        }
+    }
+
+    closesocket(listen_sock);
+    WSACleanup();
+    std::cout << "[INFO] Server shutdown complete." << std::endl;
+    return 0;
+}

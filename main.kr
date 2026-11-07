@@ -1,0 +1,454 @@
+// ============================================================================
+// Sovereign Server V10 Professional - KR Unified Language Edition
+// Root Coordinator & Application Entry Point
+// Fusion of C++20, Rust, and Go in a Single Architecture
+// ============================================================================
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <cassert>
+#include <iomanip>
+#include <sstream>
+#include <chrono>
+#include <thread>
+#include <exception>
+#include <limits>
+
+// Declarations of modules
+int cpp_start_server(const char* host, int port, int worker_count);
+
+extern "C" {
+    // Protocol (Rust)
+    bool rust_http_validate_header(uint64_t name_ptr, int32_t name_len, uint64_t val_ptr, int32_t val_len);
+    int32_t rust_sanitize_path(uint64_t in_ptr, int32_t in_len, uint64_t out_ptr, int32_t max_out);
+    int32_t rust_http_parse_request(uint64_t raw_ptr, int32_t raw_len, uint64_t out_method, int32_t max_method, uint64_t out_path, int32_t max_path, uint64_t out_version, int32_t max_version, uint64_t out_meta, uint64_t out_auth_bearer, int32_t max_auth, uint64_t out_ws_key, int32_t max_ws_key);
+    int32_t rust_ws_compute_accept_key(uint64_t sec_ws_key, int32_t key_len, uint64_t out_buf, int32_t max_len);
+    int32_t rust_ws_parse_frame_header(uint64_t buf, int32_t len, uint64_t out_info);
+    int32_t rust_ws_apply_mask(uint64_t data, int32_t len, uint32_t mask_key);
+    int32_t rust_ws_build_frame_header(int32_t opcode, int64_t payload_len, uint64_t out_buf, int32_t max_out);
+
+    // Security (Rust & Go)
+    int32_t rust_sha256(uint64_t data, int32_t len, uint64_t out_digest);
+    int32_t rust_hmac_sha256(uint64_t key, int32_t key_len, uint64_t data, int32_t data_len, uint64_t out_mac);
+    bool rust_constant_time_compare(uint64_t a, int32_t a_len, uint64_t b, int32_t b_len);
+    int32_t rust_jwt_create(uint64_t secret, int32_t sec_len, uint64_t sub, int32_t sub_len, uint64_t role, int32_t role_len, int64_t exp_sec, uint64_t out_buf, int32_t max_out);
+    int32_t rust_jwt_verify(uint64_t token, int32_t tok_len, uint64_t secret, int32_t sec_len, int64_t current_time_sec, uint64_t out_sub, int32_t max_sub);
+    bool rust_token_bucket_consume(uint64_t bucket_id, int32_t max_tokens, double refill_per_sec, double now_sec);
+    bool go_security_audit_environment(void);
+    bool go_jwt_is_blacklisted(int64_t jtiId);
+    bool go_jwt_revoke_token(int64_t jtiId);
+
+    // Orchestration (Go)
+    bool go_admission_init(int32_t maxConns);
+    bool go_admission_acquire(void);
+    void go_admission_release(void);
+    int32_t go_get_active_conns(void);
+    bool go_task_init(int32_t workers, int32_t queueCap);
+    bool go_task_enqueue(int32_t taskType, int64_t payloadId);
+    int64_t go_task_get_processed(void);
+    int32_t go_task_get_queue_len(void);
+    bool go_eventhub_publish(int32_t topicId, int64_t eventVal);
+    int32_t go_eventhub_subscribe(int32_t topicId);
+    int64_t go_eventhub_published_count(void);
+    int32_t go_eventhub_subscribers_count(void);
+    void go_record_request(int32_t statusCode, int64_t latencyMicros);
+    int64_t go_metrics_total_requests(void);
+    double go_metrics_average_latency_us(void);
+    int64_t go_metrics_error_count(void);
+}
+
+static std::string hex_encode(const uint8_t* data, size_t len) {
+    std::ostringstream ss;
+    for (size_t i = 0; i < len; ++i) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << (int)data[i];
+    }
+    return ss.str();
+}
+
+static bool run_all_tests() {
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << "  RUNNING KR MULTI-LANGUAGE TEST SUITE (C++, Rust, Go)" << std::endl;
+    std::cout << "========================================================" << std::endl;
+
+    // Test 1: Rust HTTP Header CR/LF Validation
+    std::cout << "[TEST 1] Rust HTTP Header CR/LF Injection Defense ... ";
+    std::string safe_hdr = "X-Valid-Token";
+    std::string safe_val = "SafeValue123";
+    std::string bad_hdr = "X-Evil\r\nInjected";
+    std::string bad_val = "Value\r\nSet-Cookie: pwned";
+
+    bool ok_safe = rust_http_validate_header(
+        (uint64_t)safe_hdr.data(), (int32_t)safe_hdr.size(),
+        (uint64_t)safe_val.data(), (int32_t)safe_val.size()
+    );
+    bool ok_bad_hdr = rust_http_validate_header(
+        (uint64_t)bad_hdr.data(), (int32_t)bad_hdr.size(),
+        (uint64_t)safe_val.data(), (int32_t)safe_val.size()
+    );
+    bool ok_bad_val = rust_http_validate_header(
+        (uint64_t)safe_hdr.data(), (int32_t)safe_hdr.size(),
+        (uint64_t)bad_val.data(), (int32_t)bad_val.size()
+    );
+
+    if (ok_safe && !ok_bad_hdr && !ok_bad_val) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 2: Rust Path Sanitization (Directory Traversal Prevention)
+    std::cout << "[TEST 2] Rust Directory Traversal Sanitizer ... ";
+    std::string dangerous_path = "/static/../../../windows/system32/cmd.exe";
+    char clean_path[256] = {0};
+    int32_t p_len = rust_sanitize_path(
+        (uint64_t)dangerous_path.data(), (int32_t)dangerous_path.size(),
+        (uint64_t)clean_path, sizeof(clean_path)
+    );
+    if (p_len > 0 && std::string(clean_path) == "/windows/system32/cmd.exe" && std::string(clean_path).find("..") == std::string::npos) {
+        std::cout << "PASSED [OK] (Sanitized to: " << clean_path << ")" << std::endl;
+    } else {
+        std::cout << "FAILED [X] (Result: " << clean_path << ")" << std::endl;
+        return false;
+    }
+
+    // Test 3: Rust SHA-256 FIPS Standard Test Vector ("abc")
+    std::cout << "[TEST 3] Rust Pure SHA-256 FIPS 180-4 Test Vector ... ";
+    std::string test_msg = "abc";
+    uint8_t digest[32] = {0};
+    rust_sha256((uint64_t)test_msg.data(), (int32_t)test_msg.size(), (uint64_t)digest);
+    std::string hex_digest = hex_encode(digest, 32);
+    // Known SHA-256 of "abc": ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    if (hex_digest == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X] (Digest: " << hex_digest << ")" << std::endl;
+        return false;
+    }
+
+    // Test 4: Rust WebSocket RFC 6455 Handshake Accept Key (Known Vector)
+    std::cout << "[TEST 4] Rust RFC 6455 WebSocket Handshake Vector ... ";
+    std::string ws_test_key = "dGhlIHNhbXBsZSBub25jZQ==";
+    char ws_accept[64] = {0};
+    int32_t ws_ret = rust_ws_compute_accept_key(
+        (uint64_t)ws_test_key.data(), (int32_t)ws_test_key.size(),
+        (uint64_t)ws_accept, sizeof(ws_accept)
+    );
+    if (ws_ret > 0 && std::string(ws_accept) == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") {
+        std::cout << "PASSED [OK] (" << ws_accept << ")" << std::endl;
+    } else {
+        std::cout << "FAILED [X] (Got: " << ws_accept << ")" << std::endl;
+        return false;
+    }
+
+    // Test 5: Rust JWT Cryptographic Generation & Verification
+    std::cout << "[TEST 5] Rust JWT HMAC-SHA256 Sign & Verify Lifecycle ... ";
+    std::string secret = "test_only_hmac_key_32_bytes_minimum!";
+    std::string subject = "user_sovereign_42";
+    std::string role = "system_admin";
+    auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    int64_t exp_valid = now_ts + 600; // 10 minutes in future
+
+    char jwt_token[512] = {0};
+    int32_t jwt_len = rust_jwt_create(
+        (uint64_t)secret.data(), (int32_t)secret.size(),
+        (uint64_t)subject.data(), (int32_t)subject.size(),
+        (uint64_t)role.data(), (int32_t)role.size(),
+        exp_valid,
+        (uint64_t)jwt_token, sizeof(jwt_token)
+    );
+
+    char verified_sub[128] = {0};
+    int32_t v_res = rust_jwt_verify(
+        (uint64_t)jwt_token, jwt_len,
+        (uint64_t)secret.data(), (int32_t)secret.size(),
+        now_ts,
+        (uint64_t)verified_sub, sizeof(verified_sub)
+    );
+
+    std::string wrong_secret = "wrong_secret_key";
+    char dummy_sub[128] = {0};
+    int32_t wrong_res = rust_jwt_verify(
+        (uint64_t)jwt_token, jwt_len,
+        (uint64_t)wrong_secret.data(), (int32_t)wrong_secret.size(),
+        now_ts,
+        (uint64_t)dummy_sub, sizeof(dummy_sub)
+    );
+
+    if (jwt_len > 0 && v_res > 0 && std::string(verified_sub) == subject && wrong_res < 0) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X] (Token: " << jwt_token << ", sub: " << verified_sub << ")" << std::endl;
+        return false;
+    }
+
+    // Test 6: Rust Token-Bucket Rate Limiter
+    std::cout << "[TEST 6] Rust High-Precision Token Bucket Limiter ... ";
+    uint64_t test_ip = 0x7F000001; // 127.0.0.1
+    double t_now = 1000.0;
+    bool tb1 = rust_token_bucket_consume(test_ip, 3, 1.0, t_now);
+    bool tb2 = rust_token_bucket_consume(test_ip, 3, 1.0, t_now);
+    bool tb3 = rust_token_bucket_consume(test_ip, 3, 1.0, t_now);
+    bool tb4 = rust_token_bucket_consume(test_ip, 3, 1.0, t_now); // Should fail (exhausted)
+    bool tb5 = rust_token_bucket_consume(test_ip, 3, 1.0, t_now + 2.0); // Refilled 2 tokens
+
+    if (tb1 && tb2 && tb3 && !tb4 && tb5) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 7: Go Concurrency Admission Semaphore
+    std::cout << "[TEST 7] Go Concurrency Admission Semaphore ... ";
+    go_admission_init(2);
+    bool adm1 = go_admission_acquire();
+    bool adm2 = go_admission_acquire();
+    bool adm3 = go_admission_acquire(); // Should fail (capacity 2)
+    go_admission_release();
+    bool adm4 = go_admission_acquire(); // Should succeed after release
+    go_admission_release();
+    go_admission_release();
+
+    if (adm1 && adm2 && !adm3 && adm4) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 8: Go Background Task Queue & Worker Goroutines
+    std::cout << "[TEST 8] Go Background Task Queue & Worker Goroutines ... ";
+    go_task_init(2, 64);
+    for (int i = 0; i < 5; ++i) {
+        go_task_enqueue(1, 1000 + i);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    int64_t processed = go_task_get_processed();
+    if (processed >= 5) {
+        std::cout << "PASSED [OK] (Processed " << processed << " tasks)" << std::endl;
+    } else {
+        std::cout << "FAILED [X] (Processed: " << processed << ")" << std::endl;
+        return false;
+    }
+
+    // Test 9: Go EventHub Pub/Sub Broker
+    std::cout << "[TEST 9] Go EventHub Pub/Sub Broker ... ";
+    int32_t subs = go_eventhub_subscribe(42);
+    go_eventhub_publish(42, 9999);
+    int64_t pub_count = go_eventhub_published_count();
+    int32_t active_subs = go_eventhub_subscribers_count();
+
+    if (subs >= 1 && pub_count >= 1) {
+        std::cout << "PASSED [OK] (Published: " << pub_count << ", Subscribers: " << active_subs << ")" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 10: Go Metrics & Profiling
+    std::cout << "[TEST 10] Go Metrics & Latency Profiling ... ";
+    go_record_request(200, 1500);
+    go_record_request(404, 2500);
+    int64_t tot_req = go_metrics_total_requests();
+    double avg_us = go_metrics_average_latency_us();
+    int64_t err_c = go_metrics_error_count();
+    if (tot_req >= 2 && err_c >= 1 && avg_us > 0.0) {
+        std::cout << "PASSED [OK] (Total: " << tot_req << ", Avg Latency: " << avg_us << " us, Errors: " << err_c << ")" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 11: Strict HTTP/1.1 framing and header validation
+    std::cout << "[TEST 11] Rust HTTP Framing Negative Cases ... ";
+    auto parse_http = [](const std::string& request) -> int32_t {
+        char method[32] = {0};
+        char path[512] = {0};
+        char version[32] = {0};
+        uint8_t meta[16] = {0};
+        char auth[512] = {0};
+        char ws_key[128] = {0};
+        return rust_http_parse_request(
+            (uint64_t)request.data(), (int32_t)request.size(),
+            (uint64_t)method, sizeof(method),
+            (uint64_t)path, sizeof(path),
+            (uint64_t)version, sizeof(version),
+            (uint64_t)meta,
+            (uint64_t)auth, sizeof(auth),
+            (uint64_t)ws_key, sizeof(ws_key));
+    };
+    std::string valid_http = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    std::string duplicate_cl = "POST /auth/token HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n";
+    std::string transfer_encoded = "POST /api/tasks HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+    std::string valid_body_header = "POST /index.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n";
+    std::string leading_zero_length = "POST /index.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 012\r\n\r\n";
+    std::string oversized_body = "POST /index.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16777217\r\n\r\n";
+    std::string missing_host = "GET /health HTTP/1.1\r\nConnection: close\r\n\r\n";
+    std::string poisoned_host = "GET /health HTTP/1.1\r\nHost: attacker.example\r\n\r\n";
+    std::string duplicate_connection = "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n";
+    std::string ambiguous_request_line = "GET  /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    std::string noncanonical_ws_key = "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZR==\r\n\r\n";
+    std::string nul_header = "GET /health HTTP/1.1\r\nHost: local";
+    nul_header.push_back('\0');
+    nul_header += "host\r\n\r\n";
+    if (parse_http(valid_http) == 0 && parse_http(valid_body_header) == 0 && parse_http(duplicate_cl) < 0 &&
+        parse_http(transfer_encoded) < 0 && parse_http(missing_host) < 0 &&
+        parse_http(poisoned_host) < 0 && parse_http(duplicate_connection) < 0 &&
+        parse_http(leading_zero_length) < 0 && parse_http(oversized_body) < 0 &&
+        parse_http(ambiguous_request_line) < 0 && parse_http(noncanonical_ws_key) < 0 &&
+        parse_http(nul_header) < 0) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 12: WebSocket parser rejects unsafe/non-canonical frames
+    std::cout << "[TEST 12] Rust WebSocket Frame Negative Cases ... ";
+    uint8_t ws_info[17] = {0};
+    uint8_t masked_empty[] = {0x81, 0x80, 0x00, 0x00, 0x00, 0x00};
+    uint8_t unmasked[] = {0x81, 0x00};
+    uint8_t fragmented[] = {0x01, 0x80, 0x00, 0x00, 0x00, 0x00};
+    uint8_t continuation[] = {0x80, 0x80, 0x00, 0x00, 0x00, 0x00};
+    uint8_t nonminimal[] = {0x81, 0xFE, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x41};
+    uint8_t oversized[] = {0x82, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                           0x00, 0x00, 0x00, 0x00};
+    uint8_t out_header[10] = {0};
+    bool ws_negative_ok =
+        rust_ws_parse_frame_header((uint64_t)masked_empty, sizeof(masked_empty), (uint64_t)ws_info) == 6 &&
+        rust_ws_parse_frame_header((uint64_t)unmasked, sizeof(unmasked), (uint64_t)ws_info) < 0 &&
+        rust_ws_parse_frame_header((uint64_t)fragmented, sizeof(fragmented), (uint64_t)ws_info) < 0 &&
+        rust_ws_parse_frame_header((uint64_t)continuation, sizeof(continuation), (uint64_t)ws_info) < 0 &&
+        rust_ws_parse_frame_header((uint64_t)nonminimal, sizeof(nonminimal), (uint64_t)ws_info) < 0 &&
+        rust_ws_parse_frame_header((uint64_t)oversized, sizeof(oversized), (uint64_t)ws_info) < 0 &&
+        rust_ws_build_frame_header(1, -1, (uint64_t)out_header, sizeof(out_header)) < 0;
+    if (ws_negative_ok) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 13: JWT fail-closed claim, expiry, and key-size behavior
+    std::cout << "[TEST 13] Rust JWT Fail-Closed Negative Cases ... ";
+    char expired_token[512] = {0};
+    int32_t expired_len = rust_jwt_create(
+        (uint64_t)secret.data(), (int32_t)secret.size(),
+        (uint64_t)subject.data(), (int32_t)subject.size(),
+        (uint64_t)role.data(), (int32_t)role.size(),
+        now_ts - 1, (uint64_t)expired_token, sizeof(expired_token));
+    char expired_sub[128] = {0};
+    int32_t expired_result = rust_jwt_verify(
+        (uint64_t)expired_token, expired_len,
+        (uint64_t)secret.data(), (int32_t)secret.size(), now_ts,
+        (uint64_t)expired_sub, sizeof(expired_sub));
+    std::string no_exp_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyX3dpdGhvdXRfZXhwIiwicm9sZSI6InN5c3RlbV9hZG1pbiJ9.Tyj5RH7vDhM2eRlh-SGqVyWLXioepfeJ05PrIdwzR5w";
+    char no_exp_sub[128] = {0};
+    int32_t no_exp_result = rust_jwt_verify(
+        (uint64_t)no_exp_token.data(), (int32_t)no_exp_token.size(),
+        (uint64_t)secret.data(), (int32_t)secret.size(), now_ts,
+        (uint64_t)no_exp_sub, sizeof(no_exp_sub));
+    std::string short_secret = "too_short";
+    char short_key_token[512] = {0};
+    int32_t short_key_result = rust_jwt_create(
+        (uint64_t)short_secret.data(), (int32_t)short_secret.size(),
+        (uint64_t)subject.data(), (int32_t)subject.size(),
+        (uint64_t)role.data(), (int32_t)role.size(), exp_valid,
+        (uint64_t)short_key_token, sizeof(short_key_token));
+    std::string unsafe_subject = "admin\"injected";
+    int32_t unsafe_claim_result = rust_jwt_create(
+        (uint64_t)secret.data(), (int32_t)secret.size(),
+        (uint64_t)unsafe_subject.data(), (int32_t)unsafe_subject.size(),
+        (uint64_t)role.data(), (int32_t)role.size(), exp_valid,
+        (uint64_t)short_key_token, sizeof(short_key_token));
+    std::string oversized_secret(257, 'x');
+    int32_t oversized_key_result = rust_jwt_create(
+        (uint64_t)oversized_secret.data(), (int32_t)oversized_secret.size(),
+        (uint64_t)subject.data(), (int32_t)subject.size(),
+        (uint64_t)role.data(), (int32_t)role.size(), exp_valid,
+        (uint64_t)short_key_token, sizeof(short_key_token));
+    if (expired_len > 0 && expired_result < 0 && no_exp_result < 0 && short_key_result < 0 &&
+        unsafe_claim_result < 0 && oversized_key_result < 0) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    // Test 14: Rate limiter rejects invalid security parameters
+    std::cout << "[TEST 14] Rust Rate Limiter Fail-Closed Inputs ... ";
+    bool invalid_capacity = rust_token_bucket_consume(0x100000001ULL, 0, 1.0, t_now);
+    bool invalid_refill = rust_token_bucket_consume(0x100000002ULL, 3, -1.0, t_now);
+    bool invalid_time = rust_token_bucket_consume(
+        0x100000003ULL, 3, 1.0, std::numeric_limits<double>::quiet_NaN());
+    if (!invalid_capacity && !invalid_refill && !invalid_time) {
+        std::cout << "PASSED [OK]" << std::endl;
+    } else {
+        std::cout << "FAILED [X]" << std::endl;
+        return false;
+    }
+
+    std::cout << "========================================================" << std::endl;
+    std::cout << "  ALL 14 KR MULTI-LANGUAGE TESTS PASSED SUCCESSFULLY!   " << std::endl;
+    std::cout << "========================================================" << std::endl;
+    return true;
+}
+
+int main(int argc, char* argv[]) {
+    std::string host = "127.0.0.1";
+    int port = 8085;
+    int workers = 8;
+    bool run_tests_flag = false;
+
+    try {
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--test") {
+                run_tests_flag = true;
+            } else if (arg == "--host" && i + 1 < argc) {
+                host = argv[++i];
+            } else if (arg == "--port" && i + 1 < argc) {
+                port = std::stoi(argv[++i]);
+            } else if (arg == "--workers" && i + 1 < argc) {
+                workers = std::stoi(argv[++i]);
+            } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Sovereign Server V10 Professional - KR Unified Language Edition\n"
+                      << "Usage: " << argv[0] << " [options]\n\n"
+                      << "Options:\n"
+                      << "  --test            Run complete multilingual test suite and exit\n"
+                      << "  --host <ip>       Bind IP address (security policy: 127.0.0.1 only)\n"
+                      << "  --port <port>     Bind TCP port (default: 8080)\n"
+                      << "  --workers <count> Number of worker threads (default: 8)\n"
+                      << "  --help, -h        Display this help message\n";
+            return 0;
+            } else {
+                std::cerr << "Invalid or incomplete command-line option: " << arg << std::endl;
+                return 2;
+            }
+        }
+    } catch (const std::exception&) {
+        std::cerr << "Invalid numeric command-line value." << std::endl;
+        return 2;
+    }
+
+    if (port < 1 || port > 65535 || workers < 1 || workers > 256) {
+        std::cerr << "Port must be 1-65535 and workers must be 1-256." << std::endl;
+        return 2;
+    }
+
+    if (run_tests_flag) {
+        bool ok = run_all_tests();
+        return ok ? 0 : 1;
+    }
+
+    // Always run quick verification of environment
+    if (!go_security_audit_environment()) {
+        std::cerr << "[CRITICAL] Security audit failed on startup!" << std::endl;
+        return 1;
+    }
+
+    return cpp_start_server(host.c_str(), port, workers);
+}

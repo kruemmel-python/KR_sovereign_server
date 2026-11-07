@@ -1,0 +1,528 @@
+// ============================================================================
+// KR Unified Language - Module: Protocol (HTTP/1.1 & RFC 6455 WebSocket)
+// Language: Rust (Algorithmic Protocol State Machine & Secure Framing)
+// ============================================================================
+
+fn rust_http_validate_header(name_ptr: u64, name_len: i32, val_ptr: u64, val_len: i32) -> bool {
+    if name_ptr == 0 || val_ptr == 0 || name_len <= 0 || val_len < 0 {
+        return false;
+    }
+    let name_slice = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+    let val_slice = unsafe { std::slice::from_raw_parts(val_ptr as *const u8, val_len as usize) };
+
+    for &b in name_slice {
+        let is_tchar = b.is_ascii_alphanumeric() || matches!(b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' |
+            b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~');
+        if !is_tchar {
+            return false;
+        }
+    }
+    for &b in val_slice {
+        if b < 32 || b == 127 {
+            return false;
+        }
+    }
+    true
+}
+
+fn rust_sanitize_path(in_ptr: u64, in_len: i32, out_ptr: u64, max_out: i32) -> i32 {
+    if in_ptr == 0 || out_ptr == 0 || in_len <= 0 || max_out <= 0 {
+        return -1;
+    }
+    let in_bytes = unsafe { std::slice::from_raw_parts(in_ptr as *const u8, in_len as usize) };
+    let in_str = match std::str::from_utf8(in_bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let raw_path = match in_str.split_once('?') {
+        Some((p, _)) => p,
+        None => in_str,
+    };
+
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in raw_path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            segments.pop(); // Prevent path traversal escaping root
+        } else {
+            segments.push(seg);
+        }
+    }
+
+    let mut clean = String::with_capacity(raw_path.len() + 1);
+    clean.push('/');
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            clean.push('/');
+        }
+        clean.push_str(seg);
+    }
+
+    let clean_bytes = clean.as_bytes();
+    if clean_bytes.len() as i32 >= max_out {
+        return -1;
+    }
+    unsafe {
+        let dest = out_ptr as *mut u8;
+        std::ptr::copy_nonoverlapping(clean_bytes.as_ptr(), dest, clean_bytes.len());
+        *dest.add(clean_bytes.len()) = 0;
+    }
+    clean_bytes.len() as i32
+}
+
+fn rust_http_parse_request(raw_ptr: u64, raw_len: i32, out_method: u64, max_method: i32, out_path: u64, max_path: i32, out_version: u64, max_version: i32, out_meta: u64, out_auth_bearer: u64, max_auth: i32, out_ws_key: u64, max_ws_key: i32) -> i32 {
+    if raw_ptr == 0 || raw_len < 10 || raw_len > 8191 || out_method == 0 ||
+       out_path == 0 || out_version == 0 || out_meta == 0 ||
+       out_auth_bearer == 0 || out_ws_key == 0 || max_method <= 1 ||
+       max_path <= 1 || max_version <= 1 || max_auth <= 1 || max_ws_key <= 1 {
+        return -1;
+    }
+    let data = unsafe { std::slice::from_raw_parts(raw_ptr as *const u8, raw_len as usize) };
+    let text = match std::str::from_utf8(data) {
+        Ok(t) => t,
+        Err(_) => return -1,
+    };
+
+    // The parser receives the header block only. Requiring one exact terminator
+    // prevents partial-header and pipeline ambiguity; the C++ layer then reads
+    // exactly the validated Content-Length without over-reading another request.
+    if !text.ends_with("\r\n\r\n") || text[..text.len() - 4].contains("\r\n\r\n") {
+        return -1;
+    }
+
+    let mut lines = text.split("\r\n");
+    let req_line = match lines.next() {
+        Some(l) => l,
+        None => return -1,
+    };
+
+    // Require exactly two SP delimiters. Accepting tabs or repeated whitespace
+    // here can create request-routing disagreements with a reverse proxy.
+    let mut parts = req_line.split(' ');
+    let method = match parts.next() { Some(v) if !v.is_empty() => v, _ => return -1 };
+    let path = match parts.next() { Some(v) if !v.is_empty() => v, _ => return -1 };
+    let version = match parts.next() { Some(v) if !v.is_empty() => v, _ => return -1 };
+    if parts.next().is_some() {
+        return -1;
+    }
+
+    if method.len() >= max_method as usize || path.len() >= max_path as usize ||
+       version.len() >= max_version as usize || version != "HTTP/1.1" ||
+       path.is_empty() || !path.starts_with('/') ||
+       !method.as_bytes().iter().all(|b| b.is_ascii_uppercase()) ||
+       path.as_bytes().iter().any(|b| *b < 33 || *b == 127) {
+        return -1;
+    }
+
+    unsafe {
+        let m_dest = out_method as *mut u8;
+        let m_bytes = method.as_bytes();
+        let m_len = m_bytes.len().min((max_method - 1).max(0) as usize);
+        std::ptr::copy_nonoverlapping(m_bytes.as_ptr(), m_dest, m_len);
+        *m_dest.add(m_len) = 0;
+
+        let p_dest = out_path as *mut u8;
+        let p_bytes = path.as_bytes();
+        let p_len = p_bytes.len().min((max_path - 1).max(0) as usize);
+        std::ptr::copy_nonoverlapping(p_bytes.as_ptr(), p_dest, p_len);
+        *p_dest.add(p_len) = 0;
+
+        let v_dest = out_version as *mut u8;
+        let v_bytes = version.as_bytes();
+        let v_len = v_bytes.len().min((max_version - 1).max(0) as usize);
+        std::ptr::copy_nonoverlapping(v_bytes.as_ptr(), v_dest, v_len);
+        *v_dest.add(v_len) = 0;
+
+        let auth_dest = out_auth_bearer as *mut u8;
+        *auth_dest = 0;
+
+        let ws_dest = out_ws_key as *mut u8;
+        *ws_dest = 0;
+    }
+
+    let mut is_upgrade = false;
+    let mut is_ws_proto = false;
+    let mut content_length: i64 = 0;
+    let mut keep_alive = true;
+    let mut saw_content_length = false;
+    let mut saw_authorization = false;
+    let mut saw_ws_key = false;
+    let mut ws_version_13 = false;
+    let mut saw_ws_version = false;
+    let mut saw_upgrade = false;
+    let mut saw_host = false;
+    let mut saw_connection = false;
+
+    for line in lines {
+        if line.is_empty() {
+            break; // End of headers
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return -1;
+        }
+        if let Some((name, val)) = line.split_once(':') {
+            if !rust_http_validate_header(name.as_ptr() as u64, name.len() as i32,
+                                          val.as_ptr() as u64, val.len() as i32) {
+                return -1;
+            }
+            let n_lower = name.trim().to_lowercase();
+            let v_trim = val.trim();
+            if n_lower == "host" {
+                if saw_host || v_trim.is_empty() || v_trim.len() > 255 { return -1; }
+                let host_valid = if v_trim.eq_ignore_ascii_case("localhost") || v_trim == "127.0.0.1" {
+                    true
+                } else if let Some((host_part, port_part)) = v_trim.rsplit_once(':') {
+                    let allowed_host = host_part.eq_ignore_ascii_case("localhost") || host_part == "127.0.0.1";
+                    let canonical_port = !port_part.is_empty() && port_part.len() <= 5 &&
+                        port_part.as_bytes().iter().all(|b| b.is_ascii_digit()) &&
+                        (port_part.len() == 1 || !port_part.starts_with('0'));
+                    let port_valid = canonical_port && match port_part.parse::<u32>() {
+                        Ok(port) => port >= 1 && port <= 65535,
+                        Err(_) => false,
+                    };
+                    allowed_host && port_valid
+                } else {
+                    false
+                };
+                if !host_valid { return -1; }
+                saw_host = true;
+            } else if n_lower == "content-length" {
+                if saw_content_length { return -1; }
+                saw_content_length = true;
+                if v_trim.is_empty() || !v_trim.as_bytes().iter().all(|b| b.is_ascii_digit()) ||
+                   (v_trim.len() > 1 && v_trim.starts_with('0')) {
+                    return -1;
+                }
+                content_length = match v_trim.parse::<i64>() {
+                    Ok(v) if v >= 0 && v <= 16 * 1024 * 1024 => v,
+                    _ => return -1,
+                };
+            } else if n_lower == "transfer-encoding" {
+                return -1;
+            } else if n_lower == "connection" {
+                if saw_connection { return -1; }
+                saw_connection = true;
+                let v_lower = v_trim.to_lowercase();
+                let connection_tokens: Vec<&str> = v_lower.split(',').map(|v| v.trim()).collect();
+                if connection_tokens.iter().any(|v| *v == "close") {
+                    keep_alive = false;
+                }
+                if connection_tokens.iter().any(|v| *v == "upgrade") {
+                    is_upgrade = true;
+                }
+            } else if n_lower == "upgrade" {
+                if saw_upgrade { return -1; }
+                saw_upgrade = true;
+                if v_trim.eq_ignore_ascii_case("websocket") {
+                    is_ws_proto = true;
+                }
+            } else if n_lower == "sec-websocket-key" {
+                if saw_ws_key || v_trim.len() != 24 || v_trim.len() >= max_ws_key as usize {
+                    return -1;
+                }
+                let key_bytes = v_trim.as_bytes();
+                if !key_bytes[..22].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/') ||
+                   !matches!(key_bytes[21], b'A' | b'Q' | b'g' | b'w') ||
+                   key_bytes[22] != b'=' || key_bytes[23] != b'=' {
+                    return -1;
+                }
+                saw_ws_key = true;
+                let k_bytes = v_trim.as_bytes();
+                let k_len = k_bytes.len().min((max_ws_key - 1).max(0) as usize);
+                unsafe {
+                    let ws_dest = out_ws_key as *mut u8;
+                    std::ptr::copy_nonoverlapping(k_bytes.as_ptr(), ws_dest, k_len);
+                    *ws_dest.add(k_len) = 0;
+                }
+            } else if n_lower == "sec-websocket-version" {
+                if saw_ws_version { return -1; }
+                saw_ws_version = true;
+                ws_version_13 = v_trim == "13";
+            } else if n_lower == "authorization" {
+                if saw_authorization { return -1; }
+                saw_authorization = true;
+                if v_trim.starts_with("Bearer ") {
+                    let token = &v_trim[7..];
+                    if token.is_empty() || token.len() >= max_auth as usize { return -1; }
+                    let t_bytes = token.as_bytes();
+                    let t_len = t_bytes.len().min((max_auth - 1).max(0) as usize);
+                    unsafe {
+                        let auth_dest = out_auth_bearer as *mut u8;
+                        std::ptr::copy_nonoverlapping(t_bytes.as_ptr(), auth_dest, t_len);
+                        *auth_dest.add(t_len) = 0;
+                    }
+                }
+            }
+        } else {
+            return -1;
+        }
+    }
+
+    if !saw_host { return -1; }
+    if content_length > 0 && !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
+        return -1;
+    }
+    let is_ws = is_upgrade && is_ws_proto && saw_ws_key && ws_version_13;
+
+    unsafe {
+        let meta_dest = out_meta as *mut u8;
+        *meta_dest = if keep_alive { 1 } else { 0 };
+        *meta_dest.add(1) = if is_ws { 1 } else { 0 };
+        let cl_bytes = content_length.to_le_bytes();
+        std::ptr::copy_nonoverlapping(cl_bytes.as_ptr(), meta_dest.add(2), 8);
+    }
+
+    0 // Success
+}
+
+// ============================================================================
+// RFC 3174 SHA-1 for RFC 6455 WebSocket Handshake
+// ============================================================================
+
+fn internal_sha1(data: &[u8]) -> Vec<u8> {
+    let mut h0: u32 = 0x67452301;
+    let mut h1: u32 = 0xEFCDAB89;
+    let mut h2: u32 = 0x98BADCFE;
+    let mut h3: u32 = 0x10325476;
+    let mut h4: u32 = 0xC3D2E1F0;
+
+    let ml = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0x00);
+    }
+    msg.extend_from_slice(&ml.to_be_bytes());
+
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[i*4], chunk[i*4+1], chunk[i*4+2], chunk[i*4+3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]).rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+
+            let temp = a.rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = Vec::with_capacity(20);
+    out.extend_from_slice(&h0.to_be_bytes());
+    out.extend_from_slice(&h1.to_be_bytes());
+    out.extend_from_slice(&h2.to_be_bytes());
+    out.extend_from_slice(&h3.to_be_bytes());
+    out.extend_from_slice(&h4.to_be_bytes());
+    out
+}
+
+fn internal_base64_encode(input: &[u8]) -> String {
+    const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        let idx0 = (b0 >> 2) as usize;
+        let idx1 = (((b0 & 0x03) << 4) | (b1 >> 4)) as usize;
+        let idx2 = (((b1 & 0x0F) << 2) | (b2 >> 6)) as usize;
+        let idx3 = (b2 & 0x3F) as usize;
+
+        out.push(B64_CHARS[idx0] as char);
+        out.push(B64_CHARS[idx1] as char);
+        if chunk.len() > 1 {
+            out.push(B64_CHARS[idx2] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(B64_CHARS[idx3] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn rust_ws_compute_accept_key(sec_ws_key: u64, key_len: i32, out_buf: u64, max_len: i32) -> i32 {
+    if sec_ws_key == 0 || out_buf == 0 || key_len != 24 || max_len < 30 {
+        return -1;
+    }
+    let key_bytes = unsafe { std::slice::from_raw_parts(sec_ws_key as *const u8, key_len as usize) };
+    let mut combined = Vec::with_capacity(key_len as usize + 36);
+    combined.extend_from_slice(key_bytes);
+    combined.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+
+    let digest = internal_sha1(&combined);
+    let b64 = internal_base64_encode(&digest);
+    let b64_bytes = b64.as_bytes();
+
+    if b64_bytes.len() as i32 >= max_len {
+        return -1;
+    }
+    unsafe {
+        let dest = out_buf as *mut u8;
+        std::ptr::copy_nonoverlapping(b64_bytes.as_ptr(), dest, b64_bytes.len());
+        *dest.add(b64_bytes.len()) = 0;
+    }
+    b64_bytes.len() as i32
+}
+
+// ============================================================================
+// WebSocket RFC 6455 Frame Parser & Framing
+// ============================================================================
+
+fn rust_ws_parse_frame_header(buf: u64, len: i32, out_info: u64) -> i32 {
+    if buf == 0 || out_info == 0 || len < 2 {
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let b0 = slice[0];
+    let b1 = slice[1];
+
+    if (b0 & 0x70) != 0 {
+        return -1; // RSV bits require a negotiated extension; none is supported.
+    }
+
+    let fin = (b0 & 0x80) != 0;
+    let opcode = (b0 & 0x0F) as i32;
+    let masked = (b1 & 0x80) != 0;
+    let basic_len = (b1 & 0x7F) as usize;
+
+    if !masked || !matches!(opcode, 1 | 2 | 8 | 9 | 10) {
+        return -1; // RFC 6455 requires all client frames to be masked.
+    }
+    if opcode >= 8 && (!fin || basic_len > 125) {
+        return -1;
+    }
+    if opcode < 8 && !fin {
+        return -1; // Fragmentation is unsupported; reject instead of changing semantics.
+    }
+
+    let mut header_size = 2;
+    let payload_len: i64;
+
+    if basic_len <= 125 {
+        payload_len = basic_len as i64;
+    } else if basic_len == 126 {
+        if len < 4 {
+            return -1; // Need more data
+        }
+        payload_len = u16::from_be_bytes([slice[2], slice[3]]) as i64;
+        if payload_len < 126 { return -1; }
+        header_size += 2;
+    } else {
+        if len < 10 {
+            return -1; // Need more data
+        }
+        let raw_len = u64::from_be_bytes([
+            slice[2], slice[3], slice[4], slice[5],
+            slice[6], slice[7], slice[8], slice[9],
+        ]);
+        if raw_len > i64::MAX as u64 {
+            return -1;
+        }
+        payload_len = raw_len as i64;
+        if payload_len <= 65535 { return -1; }
+        header_size += 8;
+    }
+
+    let mut mask_key = 0u32;
+    if masked {
+        if len < (header_size + 4) as i32 {
+            return -1;
+        }
+        let m_idx = header_size;
+        mask_key = u32::from_be_bytes([slice[m_idx], slice[m_idx+1], slice[m_idx+2], slice[m_idx+3]]);
+        header_size += 4;
+    }
+
+    unsafe {
+        let dest = out_info as *mut u8;
+        *dest = if fin { 1 } else { 0 };
+        let op_bytes = opcode.to_le_bytes();
+        std::ptr::copy_nonoverlapping(op_bytes.as_ptr(), dest.add(1), 4);
+        let pl_bytes = payload_len.to_le_bytes();
+        std::ptr::copy_nonoverlapping(pl_bytes.as_ptr(), dest.add(5), 8);
+        let mk_bytes = mask_key.to_le_bytes();
+        std::ptr::copy_nonoverlapping(mk_bytes.as_ptr(), dest.add(13), 4);
+    }
+    header_size as i32
+}
+
+fn rust_ws_apply_mask(data: u64, len: i32, mask_key: u32) -> i32 {
+    if data == 0 || len <= 0 || mask_key == 0 {
+        return 0;
+    }
+    let mask_bytes = mask_key.to_be_bytes();
+    let slice = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, len as usize) };
+    for i in 0..len as usize {
+        slice[i] ^= mask_bytes[i % 4];
+    }
+    0
+}
+
+fn rust_ws_build_frame_header(opcode: i32, payload_len: i64, out_buf: u64, max_out: i32) -> i32 {
+    if out_buf == 0 || max_out < 10 || payload_len < 0 ||
+       !matches!(opcode, 1 | 2 | 8 | 9 | 10) {
+        return -1;
+    }
+    let mut header = [0u8; 10];
+    header[0] = 0x80 | ((opcode as u8) & 0x0F); // FIN=1, RSV=0, Opcode
+
+    let mut h_len = 2;
+    if payload_len <= 125 {
+        header[1] = payload_len as u8;
+    } else if payload_len <= 65535 {
+        header[1] = 126;
+        let l16 = (payload_len as u16).to_be_bytes();
+        header[2] = l16[0];
+        header[3] = l16[1];
+        h_len = 4;
+    } else {
+        header[1] = 127;
+        let l64 = (payload_len as u64).to_be_bytes();
+        header[2..10].copy_from_slice(&l64);
+        h_len = 10;
+    }
+
+    unsafe {
+        let dest = out_buf as *mut u8;
+        std::ptr::copy_nonoverlapping(header.as_ptr(), dest, h_len);
+    }
+    h_len as i32
+}

@@ -1,0 +1,417 @@
+// ============================================================================
+// KR Unified Language - Module: Security (Crypto, JWT, Rate Limiting & Blacklist)
+// Languages: Rust (Crypto Kernels & Token Bucket) & Go (Security Audit & Blocklist)
+// ============================================================================
+
+import "sync"
+import "os"
+
+// ----------------------------------------------------------------------------
+// Rust: SHA-256, HMAC-SHA256, Constant-Time Compare, JWT & Rate Limiting
+// ----------------------------------------------------------------------------
+
+fn internal_sha256(data: &[u8]) -> Vec<u8> {
+    const SHA256_K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0x00);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[i*4], chunk[i*4+1], chunk[i*4+2], chunk[i*4+3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+            let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = Vec::with_capacity(32);
+    for val in h.iter() {
+        out.extend_from_slice(&val.to_be_bytes());
+    }
+    out
+}
+
+fn rust_sha256(data: u64, len: i32, out_digest: u64) -> i32 {
+    if data == 0 || out_digest == 0 || len < 0 {
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+    let digest = internal_sha256(slice);
+    unsafe {
+        let dest = out_digest as *mut u8;
+        std::ptr::copy_nonoverlapping(digest.as_ptr(), dest, 32);
+    }
+    32
+}
+
+fn internal_hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let hash = internal_sha256(key);
+        k[..32].copy_from_slice(&hash);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+
+    let mut inner = Vec::with_capacity(64 + data.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(data);
+    let inner_hash = internal_sha256(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    internal_sha256(&outer)
+}
+
+fn rust_hmac_sha256(key: u64, key_len: i32, data: u64, data_len: i32, out_mac: u64) -> i32 {
+    if key == 0 || data == 0 || out_mac == 0 || key_len < 0 || data_len < 0 {
+        return -1;
+    }
+    let k_slice = unsafe { std::slice::from_raw_parts(key as *const u8, key_len as usize) };
+    let d_slice = unsafe { std::slice::from_raw_parts(data as *const u8, data_len as usize) };
+    let mac = internal_hmac_sha256(k_slice, d_slice);
+    unsafe {
+        let dest = out_mac as *mut u8;
+        std::ptr::copy_nonoverlapping(mac.as_ptr(), dest, 32);
+    }
+    32
+}
+
+fn rust_constant_time_compare(a: u64, a_len: i32, b: u64, b_len: i32) -> bool {
+    if a == 0 || b == 0 || a_len != b_len || a_len < 0 {
+        return false;
+    }
+    let a_slice = unsafe { std::slice::from_raw_parts(a as *const u8, a_len as usize) };
+    let b_slice = unsafe { std::slice::from_raw_parts(b as *const u8, b_len as usize) };
+    let mut diff = 0u8;
+    for i in 0..a_len as usize {
+        diff |= a_slice[i] ^ b_slice[i];
+    }
+    diff == 0
+}
+
+fn rust_base64url_encode(input: &[u8]) -> String {
+    let b64 = internal_base64_encode(input);
+    b64.replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
+}
+
+fn rust_base64url_decode(input: &str) -> Option<Vec<u8>> {
+    if input.is_empty() || input.len() % 4 == 1 ||
+       !input.as_bytes().iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_') {
+        return None;
+    }
+    let mut s = input.replace('-', "+").replace('_', "/");
+    while (s.len() % 4) != 0 {
+        s.push('=');
+    }
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(4) {
+        if chunk.len() < 4 {
+            return None;
+        }
+        let mut vals = [0u8; 4];
+        for i in 0..4 {
+            let c = chunk[i];
+            vals[i] = if (b'A'..=b'Z').contains(&c) { c - b'A' }
+            else if (b'a'..=b'z').contains(&c) { c - b'a' + 26 }
+            else if (b'0'..=b'9').contains(&c) { c - b'0' + 52 }
+            else if c == b'+' { 62 }
+            else if c == b'/' { 63 }
+            else if c == b'=' { 0 }
+            else { return None; };
+        }
+        let b0 = (vals[0] << 2) | (vals[1] >> 4);
+        out.push(b0);
+        if chunk[2] != b'=' {
+            let b1 = ((vals[1] & 0x0F) << 4) | (vals[2] >> 2);
+            out.push(b1);
+        }
+        if chunk[3] != b'=' {
+            let b2 = ((vals[2] & 0x03) << 6) | vals[3];
+            out.push(b2);
+        }
+    }
+    // Reject non-canonical encodings and non-zero unused trailing bits.
+    if rust_base64url_encode(&out) != input {
+        return None;
+    }
+    Some(out)
+}
+
+fn rust_jwt_create(secret: u64, sec_len: i32, sub: u64, sub_len: i32, role: u64, role_len: i32, exp_sec: i64, out_buf: u64, max_out: i32) -> i32 {
+    if secret == 0 || sub == 0 || role == 0 || out_buf == 0 ||
+       sec_len < 32 || sec_len > 256 || sub_len <= 0 || role_len <= 0 ||
+       sub_len > 128 || role_len > 64 || exp_sec <= 0 || max_out < 64 {
+        return -1;
+    }
+    let sec_slice = unsafe { std::slice::from_raw_parts(secret as *const u8, sec_len as usize) };
+    let sub_str = match std::str::from_utf8(unsafe { std::slice::from_raw_parts(sub as *const u8, sub_len as usize) }) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let role_str = match std::str::from_utf8(unsafe { std::slice::from_raw_parts(role as *const u8, role_len as usize) }) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let safe_claim = |value: &str| value.as_bytes().iter().all(|c|
+        c.is_ascii_alphanumeric() || matches!(*c, b'_' | b'-' | b'.' | b':' | b'@'));
+    if !safe_claim(sub_str) || !safe_claim(role_str) {
+        return -1;
+    }
+
+    let header_json = r#"{"alg":"HS256","typ":"JWT"}"#;
+    let payload_json = format!(r#"{{"sub":"{}","role":"{}","exp":{}}}"#, sub_str, role_str, exp_sec);
+
+    let h_b64 = rust_base64url_encode(header_json.as_bytes());
+    let p_b64 = rust_base64url_encode(payload_json.as_bytes());
+    let msg_to_sign = format!("{}.{}", h_b64, p_b64);
+
+    let mac = internal_hmac_sha256(sec_slice, msg_to_sign.as_bytes());
+    let s_b64 = rust_base64url_encode(&mac);
+
+    let token = format!("{}.{}", msg_to_sign, s_b64);
+    let t_bytes = token.as_bytes();
+    if t_bytes.len() as i32 >= max_out {
+        return -1;
+    }
+
+    unsafe {
+        let dest = out_buf as *mut u8;
+        std::ptr::copy_nonoverlapping(t_bytes.as_ptr(), dest, t_bytes.len());
+        *dest.add(t_bytes.len()) = 0;
+    }
+    t_bytes.len() as i32
+}
+
+fn rust_jwt_verify(token: u64, tok_len: i32, secret: u64, sec_len: i32, current_time_sec: i64, out_sub: u64, max_sub: i32) -> i32 {
+    if token == 0 || secret == 0 || out_sub == 0 || tok_len <= 0 || tok_len > 4096 ||
+       sec_len < 32 || sec_len > 256 || current_time_sec <= 0 || max_sub <= 1 {
+        return -1;
+    }
+    let tok_slice = unsafe { std::slice::from_raw_parts(token as *const u8, tok_len as usize) };
+    let sec_slice = unsafe { std::slice::from_raw_parts(secret as *const u8, sec_len as usize) };
+    let tok_str = match std::str::from_utf8(tok_slice) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let parts: Vec<&str> = tok_str.split('.').collect();
+    if parts.len() != 3 {
+        return -2; // Malformed JWT
+    }
+
+    let h_b64 = parts[0];
+    let p_b64 = parts[1];
+    let sig_b64 = parts[2];
+
+    // Only tokens created by this implementation are accepted.  This also
+    // prevents algorithm/header confusion before signature verification.
+    if h_b64 != "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" {
+        return -3;
+    }
+
+    let msg_to_verify = format!("{}.{}", h_b64, p_b64);
+    let expected_mac = internal_hmac_sha256(sec_slice, msg_to_verify.as_bytes());
+
+    let given_sig = match rust_base64url_decode(sig_b64) {
+        Some(s) => s,
+        None => return -3,
+    };
+
+    if !rust_constant_time_compare(expected_mac.as_ptr() as u64, 32, given_sig.as_ptr() as u64, given_sig.len() as i32) {
+        return -4; // Signature mismatch
+    }
+
+    let payload_bytes = match rust_base64url_decode(p_b64) {
+        Some(p) => p,
+        None => return -5,
+    };
+    let payload_str = match std::str::from_utf8(&payload_bytes) {
+        Ok(s) => s,
+        Err(_) => return -5,
+    };
+
+    // Accept only the canonical claim shape emitted by rust_jwt_create. This
+    // rejects duplicate/ambiguous claims and prevents JSON parser differentials.
+    let payload_prefix = r#"{"sub":""#;
+    let role_marker = r#"","role":""#;
+    let exp_marker = r#"","exp":"#;
+    if !payload_str.starts_with(payload_prefix) || !payload_str.ends_with('}') {
+        return -5;
+    }
+    let after_prefix = &payload_str[payload_prefix.len()..payload_str.len() - 1];
+    let role_pos = match after_prefix.find(role_marker) { Some(i) => i, None => return -5 };
+    let sub_val = &after_prefix[..role_pos];
+    let after_role = &after_prefix[role_pos + role_marker.len()..];
+    let exp_pos = match after_role.find(exp_marker) { Some(i) => i, None => return -5 };
+    let role_val = &after_role[..exp_pos];
+    let exp_text = &after_role[exp_pos + exp_marker.len()..];
+    let safe_claim = |value: &str| !value.is_empty() && value.as_bytes().iter().all(|c|
+        c.is_ascii_alphanumeric() || matches!(*c, b'_' | b'-' | b'.' | b':' | b'@'));
+    if !safe_claim(sub_val) || !safe_claim(role_val) || sub_val.len() >= max_sub as usize ||
+       exp_text.is_empty() || !exp_text.as_bytes().iter().all(|c| c.is_ascii_digit()) {
+        return -7;
+    }
+    let exp_num = match exp_text.parse::<i64>() { Ok(v) => v, Err(_) => return -6 };
+    if exp_num <= current_time_sec {
+        return -6;
+    }
+
+    let sub_bytes = sub_val.as_bytes();
+    unsafe {
+        let dest = out_sub as *mut u8;
+        std::ptr::copy_nonoverlapping(sub_bytes.as_ptr(), dest, sub_bytes.len());
+        *dest.add(sub_bytes.len()) = 0;
+    }
+    sub_bytes.len() as i32
+}
+
+// ----------------------------------------------------------------------------
+// Rust: In-Memory Token Bucket Rate Limiter
+// ----------------------------------------------------------------------------
+
+fn rust_token_bucket_consume(bucket_id: u64, max_tokens: i32, refill_per_sec: f64, now_sec: f64) -> bool {
+    static BUCKET_STORE: std::sync::Mutex<Option<std::collections::HashMap<u64, (f64, f64)>>> = std::sync::Mutex::new(None);
+
+    let mut guard = match BUCKET_STORE.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    if guard.is_none() {
+        *guard = Some(std::collections::HashMap::new());
+    }
+    let store = match guard.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+
+    if max_tokens <= 0 || !refill_per_sec.is_finite() || refill_per_sec < 0.0 ||
+       !now_sec.is_finite() || now_sec < 0.0 {
+        return false;
+    }
+
+    // Bound attacker-controlled bucket cardinality. Expire inactive entries
+    // before refusing a new identity so memory use cannot grow without limit.
+    if !store.contains_key(&bucket_id) && store.len() >= 16384 {
+        store.retain(|_, entry| now_sec - entry.1 <= 600.0);
+        if store.len() >= 16384 {
+            return false;
+        }
+    }
+
+    let capacity = max_tokens as f64;
+    let entry = store.entry(bucket_id).or_insert((capacity, now_sec));
+    let elapsed = (now_sec - entry.1).max(0.0);
+    entry.0 = (entry.0 + elapsed * refill_per_sec).min(capacity);
+    entry.1 = now_sec;
+
+    if entry.0 >= 1.0 {
+        entry.0 -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Go: Security Auditing & JWT Blacklist
+// ----------------------------------------------------------------------------
+
+var jwtBlocklistMutex sync.RWMutex
+var jwtBlocklist = make(map[int64]bool)
+
+func go_security_audit_environment() bool {
+    jwtSecret := os.Getenv("SOVEREIGN_JWT_SECRET")
+    bootstrapToken := os.Getenv("SOVEREIGN_BOOTSTRAP_TOKEN")
+    return len(jwtSecret) >= 32 && len(jwtSecret) <= 256 &&
+        len(bootstrapToken) >= 32 && len(bootstrapToken) <= 256 &&
+        jwtSecret != bootstrapToken
+}
+
+func go_jwt_is_blacklisted(jtiId int64) bool {
+    jwtBlocklistMutex.RLock()
+    defer jwtBlocklistMutex.RUnlock()
+    return jwtBlocklist[jtiId]
+}
+
+func go_jwt_revoke_token(jtiId int64) bool {
+    jwtBlocklistMutex.Lock()
+    defer jwtBlocklistMutex.Unlock()
+    if jtiId <= 0 {
+        return false
+    }
+    if !jwtBlocklist[jtiId] && len(jwtBlocklist) >= 65536 {
+        return false
+    }
+    jwtBlocklist[jtiId] = true
+    return true
+}

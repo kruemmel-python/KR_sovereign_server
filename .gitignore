@@ -1,0 +1,24 @@
+# KR Compiler IDE: generated and local files v2
+/KR_BUILD/
+**/KR_BUILD/
+/bin/
+/build/
+/dist/
+/target/
+**/target/
+/.gradle/
+**/.gradle/
+/.idea/
+**/.idea/
+/toolchain/
+/runtime/
+/tests/project-matrix-work*/
+/config/security/
+/config/ui-settings.properties
+**/_package_staging/
+*.class
+*.p12
+*.jks
+*.keystore
+*.pk8
+*.password

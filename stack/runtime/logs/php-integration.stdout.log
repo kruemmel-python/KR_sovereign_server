@@ -1,0 +1,9 @@
+=================================================================
+  Sovereign Server V10 Professional (KR Multi-Language Fusion)
+  C++20 (Networking) + Rust (Crypto/Protocol) + Go (Orchestration)
+=================================================================
+  Server bound and listening on http://127.0.0.1:50719
+  Worker Threads: 4
+  PHP/CMS module: enabled
+  Press CTRL+C to gracefully stop the server.
+-----------------------------------------------------------------
